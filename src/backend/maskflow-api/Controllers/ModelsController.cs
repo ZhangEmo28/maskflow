@@ -16,8 +16,10 @@ public sealed class ModelsController : MaskFlowControllerBase
     public IActionResult List([FromQuery] string? projectId)
     {
         var user = CurrentUser();
+        // In a shared project, members see the models uploaded to that project (stored under the owner).
+        var ownerId = string.IsNullOrWhiteSpace(projectId) ? user.Id : Store.RequireProjectAccess(user.Id, projectId, Permissions.Read).OwnerId;
         var models = Store.State.AiModels
-            .Where(x => x.UserId == user.Id && (string.IsNullOrWhiteSpace(projectId) || x.ProjectId is null || x.ProjectId == projectId))
+            .Where(x => x.UserId == ownerId && (string.IsNullOrWhiteSpace(projectId) || x.ProjectId == projectId || (x.ProjectId is null && ownerId == user.Id)))
             .OrderByDescending(x => x.CreatedAt)
             .Select(ToDto);
         return Ok(new { models });
@@ -30,7 +32,11 @@ public sealed class ModelsController : MaskFlowControllerBase
         var form = await Request.ReadFormAsync();
         var upload = form.Files.FirstOrDefault();
         if (upload is null) return BadRequest(new { detail = "请选择 .onnx 模型文件。" });
-        var model = await Store.AddAiModelAsync(user, upload, form["name"].FirstOrDefault(), form["projectId"].FirstOrDefault());
+        var projectId = form["projectId"].FirstOrDefault();
+        var owner = string.IsNullOrWhiteSpace(projectId)
+            ? user
+            : Store.GetUser(Store.RequireProjectAccess(user.Id, projectId, Permissions.Review).OwnerId)!;
+        var model = await Store.AddAiModelAsync(owner, upload, form["name"].FirstOrDefault(), projectId);
         return Ok(new { model = ToDto(model), user = Store.PublicUser(Store.GetUser(user.Id)!) });
     }
 
@@ -38,7 +44,9 @@ public sealed class ModelsController : MaskFlowControllerBase
     public async Task<IActionResult> Delete(string modelId)
     {
         var user = CurrentUser();
-        if (!await Store.DeleteAiModelAsync(user.Id, modelId)) return NotFound(new { detail = "Model not found." });
+        var model = Store.State.AiModels.FirstOrDefault(x => x.Id == modelId);
+        var allowed = model is not null && (model.UserId == user.Id || Store.GetProjectAccess(user.Id, model.ProjectId) is { CanReview: true });
+        if (!allowed || !await Store.DeleteAiModelAsync(model!.UserId, modelId)) return NotFound(new { detail = "Model not found." });
         await annotator.DropCachedModelAsync(modelId);
         return Ok(new { ok = true, user = Store.PublicUser(Store.GetUser(user.Id)!) });
     }

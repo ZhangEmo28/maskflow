@@ -9,4 +9,6 @@ public sealed record ProjectSummaryDto(
     int AnnotationCount,
     List<string> Labels,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string Role = "owner",
+    int MemberCount = 0);

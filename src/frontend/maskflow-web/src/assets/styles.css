@@ -6625,3 +6625,176 @@ body:has(.app-sidebar) {
   align-items: center;
   gap: 6px;
 }
+
+/* Team panel and review workflow */
+.team-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 50;
+  width: min(440px, 100vw);
+  height: 100vh;
+  overflow: auto;
+  padding: 20px;
+  border-left: 1px solid #e2e8f0;
+  background: #fff;
+  box-shadow: -18px 0 50px rgba(15, 23, 42, 0.18);
+}
+
+.team-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.team-panel-head h2 {
+  margin: 0;
+}
+
+.team-panel-head p,
+.team-hint {
+  margin: 4px 0 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.team-list {
+  margin: 14px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.team-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.team-list li > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.team-list small {
+  display: block;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.team-list select {
+  width: auto;
+}
+
+.team-role {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.team-invite {
+  opacity: 0.8;
+}
+
+.team-section {
+  margin-top: 16px;
+}
+
+.team-section h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.team-invite-form,
+.team-link {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.team-invite-form input,
+.team-link input {
+  flex: 1;
+  min-width: 0;
+}
+
+.team-invite-form select {
+  width: auto;
+}
+
+.team-assignees {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.team-assignees label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.team-assignees input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.team-status {
+  margin-top: 12px;
+  color: #0f172a;
+  font-size: 13px;
+}
+
+.review-status-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
+  font-size: 13px;
+}
+
+.review-status-card p {
+  margin: 4px 0 0;
+  color: #475569;
+}
+
+.review-status-card.submitted {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.review-status-card.approved {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.review-status-card.rejected {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.review-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.review-badge {
+  font-style: normal;
+  font-weight: 700;
+}
+
+.review-badge.submitted { color: #1d4ed8; }
+.review-badge.approved { color: #15803d; }
+.review-badge.rejected { color: #b91c1c; }

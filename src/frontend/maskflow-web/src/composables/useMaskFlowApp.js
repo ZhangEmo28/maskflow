@@ -149,6 +149,8 @@ export function useMaskFlowApp() {
     models: [],
     modelUpload: { name: "", busy: false },
     batch: null,
+    review: { status: "draft", comment: "" },
+    reviewQueue: "all",
     drawMode: false,
     drawingBox: null,
     editDrag: null,
@@ -284,12 +286,34 @@ export function useMaskFlowApp() {
       });
       saveSession(data);
       account.value = data.user;
+      if (await acceptPendingInvite()) return;
       const redirect = new URLSearchParams(location.search).get("redirect");
       go(redirect && redirect.startsWith("/") ? redirect : "/dashboard.html");
     } catch (error) {
       message.value = error.message;
     } finally {
       loading.value = false;
+    }
+  }
+
+  // Invitation links look like /auth.html?invite=<token>; accept once the user is signed in.
+  const pendingInviteKey = "maskflow.pendingInvite";
+  const inviteFromUrl = new URLSearchParams(location.search).get("invite");
+  if (inviteFromUrl) sessionStorage.setItem(pendingInviteKey, inviteFromUrl);
+
+  async function acceptPendingInvite() {
+    const token = sessionStorage.getItem(pendingInviteKey);
+    if (!token || !account.value) return false;
+    sessionStorage.removeItem(pendingInviteKey);
+    try {
+      const data = await apiFetch(`/api/invites/${encodeURIComponent(token)}/accept`, { method: "POST" });
+      if (data.projectId) projects.selectedId = data.projectId;
+      go("/annotate.html");
+      annotate.status = "已加入共享项目";
+      return true;
+    } catch (error) {
+      message.value = `接受邀请失败：${error.message}`;
+      return false;
     }
   }
 
@@ -452,6 +476,7 @@ export function useMaskFlowApp() {
   async function selectProject(projectId) {
     if (projectId !== projects.selectedId && !canLeaveCurrentAnnotation()) return;
     annotationSelection++;
+    if (projectId !== projects.selectedId) team.open = false;
     projects.selectedId = projectId;
     syncExportSplitFromProject();
     clearAnnotation();
@@ -595,6 +620,128 @@ export function useMaskFlowApp() {
       if (annotate.modelId === model.id) setAiMode("");
       if (data.user) account.value = data.user;
       annotate.status = `模型 ${model.name} 已删除`;
+    } catch (error) {
+      annotate.status = error.message;
+    }
+  }
+
+  // ---- Team: members, invitations, assignment, review ----
+
+  const team = reactive({ open: false, owner: null, members: [], invites: [], inviteEmail: "", inviteRole: "annotator", lastInviteUrl: "", busy: false, status: "" });
+  const currentRole = computed(() => selectedProject.value?.role || "owner");
+  const canEditProject = computed(() => ["owner", "reviewer", "annotator"].includes(currentRole.value));
+  const canReviewProject = computed(() => ["owner", "reviewer"].includes(currentRole.value));
+  const canManageProject = computed(() => currentRole.value === "owner");
+  const isSharedProject = computed(() => currentRole.value !== "owner" || (selectedProject.value?.memberCount || 0) > 0);
+  const roleLabels = { owner: "所有者", reviewer: "审核员", annotator: "标注员", viewer: "只读" };
+  const reviewLabels = { draft: "未提交", submitted: "待审核", approved: "已通过", rejected: "已驳回" };
+
+  async function loadTeam() {
+    if (!projects.selectedId) return;
+    const projectId = projects.selectedId;
+    try {
+      const data = await apiFetch(`/api/projects/${projectId}/members`);
+      if (projectId !== projects.selectedId) return;
+      team.owner = data.owner;
+      team.members = data.members || [];
+      team.invites = data.invites || [];
+    } catch (error) {
+      team.status = error.message;
+    }
+  }
+
+  async function openTeamPanel() {
+    team.open = true;
+    team.status = "";
+    team.lastInviteUrl = "";
+    await loadTeam();
+  }
+
+  async function inviteMember() {
+    const email = team.inviteEmail.trim();
+    if (!email || !projects.selectedId) return;
+    team.busy = true;
+    try {
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/members`, { method: "POST", body: { email, role: team.inviteRole } });
+      team.inviteEmail = "";
+      team.lastInviteUrl = data.inviteUrl ? `${location.origin}${data.inviteUrl}` : "";
+      team.status = data.member
+        ? `${email} 已加入项目${data.emailed ? "，已发送邮件通知" : ""}`
+        : data.emailed
+          ? `已向 ${email} 发送邀请邮件`
+          : "邮件服务未配置，请把下面的邀请链接发给对方（14 天内有效）";
+      await Promise.all([loadTeam(), refreshProjects()]);
+    } catch (error) {
+      team.status = error.message;
+    } finally {
+      team.busy = false;
+    }
+  }
+
+  async function changeMemberRole(member, role) {
+    try {
+      await apiFetch(`/api/projects/${projects.selectedId}/members/${member.userId}`, { method: "PUT", body: { role } });
+      await loadTeam();
+      team.status = `${member.email} 的角色已改为${roleLabels[role]}`;
+    } catch (error) {
+      team.status = error.message;
+    }
+  }
+
+  async function removeMember(member) {
+    const self = member.userId === account.value?.id;
+    if (!window.confirm(self ? "确定退出这个项目吗？" : `确定把 ${member.email} 移出项目吗？`)) return;
+    try {
+      await apiFetch(`/api/projects/${projects.selectedId}/members/${member.userId}`, { method: "DELETE" });
+      if (self) {
+        team.open = false;
+        projects.selectedId = "";
+        await refreshProjects();
+        await refreshFiles();
+        return;
+      }
+      await Promise.all([loadTeam(), refreshFiles(), refreshProjects()]);
+    } catch (error) {
+      team.status = error.message;
+    }
+  }
+
+  async function revokeInvite(invite) {
+    try {
+      await apiFetch(`/api/projects/${projects.selectedId}/invites/${invite.id}`, { method: "DELETE" });
+      await loadTeam();
+    } catch (error) {
+      team.status = error.message;
+    }
+  }
+
+  async function assignImages(userIds, scope) {
+    if (!projects.selectedId) return;
+    try {
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/assignments`, { method: "POST", body: { userIds, scope } });
+      await refreshFiles();
+      team.status = userIds.length ? `已分配 ${data.changed} 张图片` : `已取消 ${data.changed} 张图片的分配`;
+    } catch (error) {
+      team.status = error.message;
+    }
+  }
+
+  async function reviewCurrent(step) {
+    const file = annotate.current;
+    if (!file || !annotate.ready) return;
+    if (annotate.dirty) {
+      annotate.status = "请先保存当前修改";
+      return;
+    }
+    let comment = null;
+    if (step === "reject") {
+      comment = window.prompt("驳回原因（会显示给标注员）");
+      if (!comment?.trim()) return;
+    }
+    try {
+      const data = await apiFetch(`/api/annotations/file/${file.id}/${step}`, { method: "POST", body: { comment } });
+      applyAnnotation(data.annotation, { status: { submit: "已提交审核", approve: "已审核通过，目标已确认", reject: "已驳回" }[step] });
+      await refreshFiles();
     } catch (error) {
       annotate.status = error.message;
     }
@@ -1186,7 +1333,7 @@ export function useMaskFlowApp() {
   }
 
   async function handleAnnotatePointClick(event) {
-    if (!annotate.pointMode || annotate.drawMode || !annotate.current || !annotate.ready) return;
+    if (!annotate.pointMode || annotate.drawMode || !annotate.current || !annotate.ready || !canEditProject.value) return;
     if (event.button !== undefined && event.button !== 0 && event.button !== 2) return;
     event.preventDefault();
     const width = annotate.width || event.currentTarget?.querySelector?.("img")?.naturalWidth;
@@ -1377,6 +1524,7 @@ export function useMaskFlowApp() {
     annotate.height = annotation.height || 0;
     annotate.annotations = (annotation.annotations || []).map(normalizeAnnotationItem);
     annotate.activeId = annotate.annotations[0]?.id || "";
+    annotate.review = { status: annotation.reviewStatus || "draft", comment: annotation.reviewComment || "" };
     normalizeAnnotationLabels();
     if (options.status) {
       annotationHistory.record(annotate.annotations);
@@ -1401,6 +1549,7 @@ export function useMaskFlowApp() {
     annotate.height = 0;
     annotate.dirty = false;
     annotate.editDrag = null;
+    annotate.review = { status: "draft", comment: "" };
     resetAnnotationHistory();
   }
 
@@ -1618,6 +1767,8 @@ export function useMaskFlowApp() {
     if (annotate.filter === "annotated") rows = rows.filter((file) => file.annotated);
     if (annotate.filter === "unannotated") rows = rows.filter((file) => !file.annotated);
     if (annotate.filter === "review") rows = rows.filter((file) => file.unconfirmedCount > 0);
+    if (annotate.reviewQueue === "mine") rows = rows.filter((file) => file.assignedTo === account.value?.id);
+    else if (annotate.reviewQueue !== "all") rows = rows.filter((file) => (file.reviewStatus || "draft") === annotate.reviewQueue);
     if (annotate.queueSort === "uncertain") {
       // Active-learning style review: the least certain unreviewed images first.
       const score = (file) => (file.unconfirmedCount > 0 ? file.minConfidence ?? 1 : 2);
@@ -1954,6 +2105,10 @@ export function useMaskFlowApp() {
   }
 
   function toggleAnnotationConfirmed(annotationId) {
+    if (!canReviewProject.value) {
+      annotate.status = "确认由审核员完成：标注完成后点“提交审核”";
+      return;
+    }
     const item = annotate.annotations.find((a) => a.id === annotationId);
     if (item) {
       item.confirmed = !isAnnotationConfirmed(item);
@@ -2092,7 +2247,7 @@ export function useMaskFlowApp() {
   }
 
   function beginManualBox(event) {
-    if (!annotate.drawMode || !annotate.current || !annotate.ready) return;
+    if (!annotate.drawMode || !annotate.current || !annotate.ready || !canEditProject.value) return;
     if (event.button !== undefined && event.button !== 0) return;
     const point = pointerToYoloPoint(event);
     if (!point) return;
@@ -2161,6 +2316,10 @@ export function useMaskFlowApp() {
   // Box body → move, handle → resize, vertex → reshape polygon (Alt+click removes the vertex).
   function beginAnnotationEdit(event, item, kind, detail = {}) {
     if (!annotate.ready || annotate.drawMode || annotate.pointMode || annotate.spaceHeld) return;
+    if (!canEditProject.value) {
+      annotate.activeId = item.id;
+      return;
+    }
     if (event.button !== undefined && event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
@@ -2375,10 +2534,10 @@ export function useMaskFlowApp() {
 
   // Returns false when the key should keep its default behaviour (e.g. arrows scroll without a selection).
   function runAnnotateShortcut(shortcut) {
-    const editable = annotate.ready && !loading.value;
+    const editable = annotate.ready && !loading.value && canEditProject.value;
     switch (shortcut.action) {
       case "save":
-        if (editable && (annotate.dirty || annotationStats.value.pending)) saveAnnotation();
+        if (editable && (annotate.dirty || (canReviewProject.value && annotationStats.value.pending))) saveAnnotation();
         return true;
       case "undo":
         undoAnnotationEdit();
@@ -2793,6 +2952,11 @@ export function useMaskFlowApp() {
     window.addEventListener("blur", () => { annotate.spaceHeld = false; });
     if (needsLogin(page.value) && !session()) go("/auth.html");
     account.value = currentUser();
+    if (inviteFromUrl && account.value) {
+      acceptPendingInvite();
+      return;
+    }
+    if (inviteFromUrl) auth.mode = "login";
     refreshPage();
   });
 
@@ -2808,6 +2972,8 @@ export function useMaskFlowApp() {
     beginAnnotationEdit, onCanvasPointerDown, onCanvasPointerMove, onCanvasPointerUp, onCanvasPointerCancel,
     onCanvasDoubleClick, onCanvasWheel, undoAnnotationEdit, redoAnnotationEdit,
     effectiveAiMode, aiModeValue, setAiMode, labelsNeedingPrompt, saveLabelPrompt, uploadModel, deleteModel,
+    team, currentRole, canEditProject, canReviewProject, canManageProject, isSharedProject, roleLabels, reviewLabels,
+    openTeamPanel, inviteMember, changeMemberRole, removeMember, revokeInvite, assignImages, reviewCurrent,
     batchActive, cancelBatch,
     togglePointPromptMode, setAnnotatePointPolarity, setSegmentPointPolarity, setSegmentPromptMode,
     handleAnnotatePointClick, handleSegmentPointClick, onSegmentImageLoad,

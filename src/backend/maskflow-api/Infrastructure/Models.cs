@@ -23,6 +23,9 @@ public record MaskFlowState
     public List<AccountDevice> Devices { get; set; } = [];
     public List<DatasetExport> Exports { get; set; } = [];
     public List<AiModel> AiModels { get; set; } = [];
+    public List<ProjectMember> ProjectMembers { get; set; } = [];
+    public List<ProjectInvite> ProjectInvites { get; set; } = [];
+    public List<FileAssignment> FileAssignments { get; set; } = [];
     public Dictionary<string, List<string>> ProjectLabels { get; set; } = [];
     // projectId -> label -> SAM 3 text prompt (labels without an entry use the label itself)
     public Dictionary<string, Dictionary<string, string>> ProjectLabelPrompts { get; set; } = [];
@@ -67,7 +70,21 @@ public record SplitConfig(int Train, int Val, int Test);
 public record Project(string Id, int UserId, string Name, string Description, string DataType, SplitConfig Split, int ImageCount, int AnnotationCount, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 // Phash: 64-bit difference hash as 16 hex chars ("" = could not be computed, null = not yet computed).
 public record FileItem(int Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Kind, string? ContentType, DateTimeOffset CreatedAt, string DownloadUrl, string? Phash = null);
-public record AnnotationSet(string Id, int UserId, int FileId, int Width, int Height, List<AnnotationItem> Annotations, string YoloTxt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+// Review: draft -> submitted (annotator) -> approved / rejected (reviewer). Solo projects stay "draft".
+public record AnnotationSet(string Id, int UserId, int FileId, int Width, int Height, List<AnnotationItem> Annotations, string YoloTxt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
+    string ReviewStatus = "draft", string? ReviewComment = null, int? ReviewedBy = null, DateTimeOffset? ReviewedAt = null, int? SubmittedBy = null);
+
+// Project sharing: data and quota stay with the owner (Project.UserId); members act through their role.
+public record ProjectMember(string Id, string ProjectId, int UserId, string Role, int InvitedBy, DateTimeOffset CreatedAt)
+{
+    public static string KeyFor(string projectId, int userId) => $"{projectId}:{userId}";
+}
+public record ProjectInvite(string Id, string ProjectId, string Email, string Role, string TokenHash, int InvitedBy, DateTimeOffset CreatedAt, DateTimeOffset ExpiresAt);
+public record FileAssignment(int FileId, int UserId, int AssignedBy, DateTimeOffset AssignedAt);
+public record MemberInviteRequest(string Email, string Role);
+public record MemberRoleRequest(string Role);
+public record AssignmentRequest(List<int>? UserIds, List<int>? FileIds, string Scope = "unassigned");
+public record ReviewRequest(string? Comment);
 public record AnnotationItem(string Id, int ClassId, string? Label, YoloBox Bbox, List<double>? Segment, double Confidence, bool Confirmed = false);
 public record YoloBox(double Cx, double Cy, double Width, double Height);
 public record TaskItem(string Id, int UserId, string JobId, string Type, string? Title, string? ProjectId, int? FileId, int ImageCount, string Status, double Progress, Dictionary<string, object?>? Result, string? ErrorMessage, DateTimeOffset CreatedAt, DateTimeOffset? StartedAt, DateTimeOffset? FinishedAt);
