@@ -62,7 +62,15 @@ public sealed class ProjectsController : MaskFlowControllerBase
     public IActionResult Labels(string projectId)
     {
         var user = CurrentUser();
-        return Ok(new { labels = projectService.GetLabels(user.Id, projectId) });
+        return Ok(new { labels = projectService.GetLabels(user.Id, projectId), prompts = Store.GetLabelPrompts(user.Id, projectId) });
+    }
+
+    // English text prompts used by SAM 3 when auto-annotating with project labels.
+    [HttpPut("{projectId}/label-prompts")]
+    public async Task<IActionResult> SaveLabelPrompts(string projectId, [FromBody] LabelPromptsRequest request)
+    {
+        var user = CurrentUser();
+        return Ok(new { prompts = await Store.SaveLabelPromptsAsync(user.Id, projectId, request.Prompts) });
     }
 
     [HttpPut("{projectId}/labels")]

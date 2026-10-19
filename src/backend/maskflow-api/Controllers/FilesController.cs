@@ -32,6 +32,7 @@ public sealed class FilesController : MaskFlowControllerBase
             .Select(file =>
             {
                 var set = Store.GetAnnotationSet(user.Id, file.Id);
+                var unconfirmed = set?.Annotations.Where(x => !x.Confirmed).ToList() ?? [];
                 return new
                 {
                     file.Id,
@@ -44,7 +45,10 @@ public sealed class FilesController : MaskFlowControllerBase
                     file.CreatedAt,
                     file.DownloadUrl,
                     Annotated = set is not null,
-                    AnnotationCount = set?.Annotations.Count ?? 0
+                    AnnotationCount = set?.Annotations.Count ?? 0,
+                    // Review queue ordering: images whose least certain unreviewed target is lowest come first.
+                    UnconfirmedCount = unconfirmed.Count,
+                    MinConfidence = unconfirmed.Count == 0 ? (double?)null : unconfirmed.Min(x => x.Confidence)
                 };
             });
         return Ok(new { files, user = Store.PublicUser(Store.GetUser(user.Id)!) });

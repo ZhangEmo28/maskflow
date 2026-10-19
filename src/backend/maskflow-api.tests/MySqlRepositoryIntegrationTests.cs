@@ -36,7 +36,12 @@ public class MySqlRepositoryIntegrationTests
             await store.SaveAnnotationSetAsync(userId, new AnnotationSaveRequest(files[0].Id, 640, 480,
                 [new AnnotationItem("a1", 1, "安全帽", new YoloBox(0.5, 0.5, 0.2, 0.2), [0.4, 0.4, 0.6, 0.4, 0.6, 0.6], 0.9, true)]));
             await store.SaveProjectLabelsAsync(userId, project.Id, ["安全帽", "car", "person"]);
+            await store.SaveLabelPromptsAsync(userId, project.Id, new Dictionary<string, string?> { ["安全帽"] = "hard hat" });
             await store.DeleteFileAsync(userId, files[1].Id);
+            var weights = new byte[] { 1, 2, 3, 4 };
+            await using var weightStream = new MemoryStream(weights);
+            var model = await store.AddAiModelAsync(store.GetUser(userId)!, new FormFile(weightStream, 0, weights.Length, "file", "helmet.onnx"), null, project.Id);
+            await store.UpdateAiModelClassNamesAsync(model.Id, ["hard hat"]);
 
             var reloaded = new MaskFlowStore(new MySqlMaskFlowRepository(builder.ConnectionString));
             reloaded.Initialize();
@@ -51,6 +56,11 @@ public class MySqlRepositoryIntegrationTests
             Assert.NotNull(reloaded.OptionalUser(WithBearer(auth.Token)));
             Assert.Equal(store.State.NextFileId, state.NextFileId);
             Assert.Contains(state.Pools, x => x.Id == "platform-gpu");
+            Assert.Equal("hard hat", reloaded.PromptForLabel(project.Id, "安全帽"));
+            var reloadedModel = Assert.Single(state.AiModels);
+            Assert.Equal(["hard hat"], reloadedModel.ClassNames);
+            Assert.Equal(model.Sha256, reloadedModel.Sha256);
+            File.Delete(model.Path);
         }
         finally
         {

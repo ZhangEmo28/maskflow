@@ -62,6 +62,8 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadSessionsAsync(connection, state);
         await LoadProjectsAsync(connection, state);
         await LoadProjectLabelsAsync(connection, state);
+        await LoadLabelPromptsAsync(connection, state);
+        await LoadAiModelsAsync(connection, state);
         await LoadFilesAsync(connection, state);
         await LoadAnnotationSetsAsync(connection, state);
         await LoadTasksAsync(connection, state);
@@ -118,6 +120,12 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 x => [x.Id, x.UserId, x.Name, x.Description, x.DataType, Json(x.Split), x.ImageCount, x.AnnotationCount, x.CreatedAt, x.UpdatedAt]);
 
             await ApplyProjectLabelsAsync(connection, tx, before.ProjectLabels, current.ProjectLabels);
+            await ApplyLabelPromptsAsync(connection, tx, before.ProjectLabelPrompts, current.ProjectLabelPrompts);
+
+            await ApplyAsync(connection, tx, "ai_models", "id",
+                ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "sha256", "class_names_json", "created_at"],
+                before.AiModels, current.AiModels, x => x.Id,
+                x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Sha256, JsonOrNull(x.ClassNames), x.CreatedAt]);
 
             await ApplyAsync(connection, tx, "files", "id",
                 ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "kind", "content_type", "created_at", "download_url"],
@@ -260,6 +268,21 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         labels.Add(S(r, "label_name"));
     });
 
+    async Task LoadLabelPromptsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM project_label_prompts", r =>
+    {
+        var id = S(r, "project_id");
+        if (!s.ProjectLabelPrompts.TryGetValue(id, out var prompts))
+        {
+            prompts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            s.ProjectLabelPrompts[id] = prompts;
+        }
+
+        prompts[S(r, "label_name")] = S(r, "prompt");
+    });
+
+    async Task LoadAiModelsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM ai_models", r =>
+        s.AiModels.Add(new AiModel(S(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "sha256"), FromJson<List<string>>(N(r, "class_names_json")), D(r, "created_at"))));
+
     async Task LoadFilesAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM files", r =>
         s.Files.Add(new FileItem(I(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "kind"), N(r, "content_type"), D(r, "created_at"), S(r, "download_url"))));
 
@@ -388,6 +411,16 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 ["project_id", "label_name", "sort_order"],
                 labels.Select((label, index) => new object?[] { projectId, label, index }));
         }
+    }
+
+    static async Task ApplyLabelPromptsAsync(MySqlConnection connection, MySqlTransaction tx,
+        IReadOnlyDictionary<string, Dictionary<string, string>> previous, IReadOnlyDictionary<string, Dictionary<string, string>> current)
+    {
+        var changes = StateDiff.Compare(previous, current);
+        await DeleteKeysAsync(connection, tx, "project_label_prompts", "project_id", changes.Deletes.Concat(changes.Upserts.Select(x => x.Key)));
+        await UpsertRowsAsync(connection, tx, "project_label_prompts",
+            ["project_id", "label_name", "prompt"],
+            changes.Upserts.SelectMany(pair => pair.Value.Select(prompt => new object?[] { pair.Key, prompt.Key, prompt.Value })));
     }
 
     static async Task ExecAsync(MySqlConnection connection, MySqlTransaction? tx, string sql)
@@ -681,6 +714,28 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           daily_limit INT NOT NULL,
           daily_used INT NOT NULL,
           daily_reset_at DATE NOT NULL
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS project_label_prompts (
+          project_id VARCHAR(64) NOT NULL,
+          label_name VARCHAR(120) NOT NULL,
+          prompt VARCHAR(200) NOT NULL,
+          PRIMARY KEY (project_id, label_name)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ai_models (
+          id VARCHAR(64) PRIMARY KEY,
+          user_id INT NOT NULL,
+          project_id VARCHAR(64) NULL,
+          name VARCHAR(200) NOT NULL,
+          object_path VARCHAR(1200) NOT NULL,
+          size_bytes BIGINT NOT NULL,
+          sha256 CHAR(64) NOT NULL,
+          class_names_json JSON NULL,
+          created_at DATETIME(6) NOT NULL,
+          INDEX ix_ai_models_user_id (user_id)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """,
         """

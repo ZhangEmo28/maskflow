@@ -977,3 +977,290 @@ def _run_point_segmentation(
         "points": points,
         "labels": labels,
     }
+
+
+# --- Concept (text-prompt) annotation: one SAM 3 pass over all project label prompts ---
+
+MAX_CONCEPT_PROMPTS = 50
+MAX_PROMPT_LENGTH = 100
+
+
+def _parse_concept_prompts(raw: str) -> list[str]:
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="prompts must be a JSON array of strings.") from exc
+    if not isinstance(data, list) or not data:
+        raise HTTPException(status_code=400, detail="At least one prompt is required.")
+    if len(data) > MAX_CONCEPT_PROMPTS:
+        raise HTTPException(status_code=400, detail=f"At most {MAX_CONCEPT_PROMPTS} prompts are supported.")
+    prompts: list[str] = []
+    for item in data:
+        text = str(item or "").strip()
+        if not text or len(text) > MAX_PROMPT_LENGTH:
+            raise HTTPException(status_code=400, detail=f"Each prompt must be 1-{MAX_PROMPT_LENGTH} characters.")
+        prompts.append(text)
+    return prompts
+
+
+def _tensor_list(value: Any, cast: Any) -> list[Any]:
+    if value is None:
+        return []
+    try:
+        value = value.detach().cpu().numpy()
+    except AttributeError:
+        value = np.asarray(value)
+    return [cast(item) for item in np.asarray(value).reshape(-1).tolist()]
+
+
+def _extract_concept_instances(results: Any, prompts: list[str]) -> list[dict[str, Any]]:
+    """Map each predicted mask back to the prompt (and therefore project label) that produced it."""
+    lookup = {prompt.lower(): index for index, prompt in enumerate(prompts)}
+    instances: list[dict[str, Any]] = []
+    for result in results or []:
+        result_masks = getattr(result, "masks", None)
+        if result_masks is None or getattr(result_masks, "data", None) is None:
+            continue
+        data = result_masks.data
+        try:
+            data = data.detach().cpu().numpy()
+        except AttributeError:
+            data = np.asarray(data)
+        if data.ndim == 2:
+            data = data[None, :, :]
+
+        boxes = getattr(result, "boxes", None)
+        classes = _tensor_list(getattr(boxes, "cls", None), int) if boxes is not None else []
+        scores = _tensor_list(getattr(boxes, "conf", None), float) if boxes is not None else []
+        names = getattr(result, "names", {}) or {}
+
+        for index in range(data.shape[0]):
+            prompt_index = 0
+            if index < len(classes):
+                class_id = classes[index]
+                name = names.get(class_id) if isinstance(names, dict) else (names[class_id] if isinstance(names, list) and class_id < len(names) else None)
+                if isinstance(name, str) and name.lower() in lookup:
+                    prompt_index = lookup[name.lower()]
+                elif 0 <= class_id < len(prompts):
+                    prompt_index = class_id
+            instances.append({
+                "mask": data[index],
+                "promptIndex": prompt_index,
+                "score": scores[index] if index < len(scores) else 1.0,
+            })
+    return instances
+
+
+def _run_concept_annotation(temp_path: Path, pil_image: Image.Image, prompts: list[str], conf: float) -> dict[str, Any]:
+    try:
+        predictor = _get_predictor(conf=conf, half=True)
+        with _inference_lock:
+            if hasattr(predictor, "args"):
+                predictor.args.conf = conf
+            predictor.set_image(str(temp_path))
+            results = predictor(text=prompts)
+        instances = _extract_concept_instances(results, prompts)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    width, height = pil_image.size
+    masks: list[dict[str, Any]] = []
+    for index, instance in enumerate(instances):
+        geometry = _mask_to_geometry(instance["mask"], width, height)
+        if geometry is None:
+            continue
+        masks.append({
+            "id": f"mask-{index}",
+            "promptIndex": instance["promptIndex"],
+            "prompt": prompts[instance["promptIndex"]],
+            "score": float(instance["score"]),
+            **geometry,
+        })
+    return {"width": width, "height": height, "count": len(masks), "masks": masks}
+
+
+@app.post("/api/annotation/concepts")
+async def annotation_concepts(
+    image: UploadFile = File(...),
+    prompts: str = Form(...),
+    conf: float = Form(0.25),
+) -> dict[str, Any]:
+    if not 0.01 <= conf <= 0.95:
+        raise HTTPException(status_code=400, detail="Confidence must be between 0.01 and 0.95.")
+    prompt_list = _parse_concept_prompts(prompts)
+    content = await image.read()
+    temp_path, pil_image = await run_in_threadpool(_image_to_temp_file, image, content)
+    try:
+        return await run_in_threadpool(_run_concept_annotation, temp_path, pil_image, prompt_list, conf)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# --- Custom YOLO models (ONNX only) ---
+# .pt checkpoints are Python pickles: loading one executes arbitrary code, so user uploads are
+# accepted only as ONNX (pure data, run by onnxruntime). Export with: yolo export model=best.pt format=onnx
+
+YOLO_MODEL_DIR = Path(os.getenv("YOLO_MODEL_CACHE", str(Path(tempfile.gettempdir()) / "maskflow-yolo-models")))
+MAX_YOLO_MODEL_BYTES = int(os.getenv("YOLO_MAX_MODEL_BYTES", str(500 * 1024 * 1024)))
+MAX_LOADED_YOLO_MODELS = int(os.getenv("YOLO_MAX_LOADED_MODELS", "3"))
+_MODEL_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+_yolo_models: dict[str, tuple[float, Any]] = {}
+_yolo_lock = threading.Lock()
+
+
+def _yolo_model_path(model_id: str) -> Path:
+    if not _MODEL_ID_PATTERN.match(model_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid model id.")
+    return YOLO_MODEL_DIR / f"{model_id}.onnx"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_yolo_model(path: Path) -> Any:
+    from ultralytics import YOLO
+
+    return YOLO(str(path))
+
+
+def _get_yolo_model(model_id: str) -> Any:
+    path = _yolo_model_path(model_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Model is not cached on the inference service.")
+    mtime = path.stat().st_mtime
+    with _yolo_lock:
+        cached = _yolo_models.get(model_id)
+        if cached and cached[0] == mtime:
+            _yolo_models[model_id] = _yolo_models.pop(model_id)  # mark most recently used
+            return cached[1]
+        model = _load_yolo_model(path)
+        _yolo_models[model_id] = (mtime, model)
+        while len(_yolo_models) > MAX_LOADED_YOLO_MODELS:
+            _yolo_models.pop(next(iter(_yolo_models)))
+        return model
+
+
+@app.get("/api/yolo/models/{model_id}")
+def yolo_model_status(model_id: str) -> dict[str, Any]:
+    path = _yolo_model_path(model_id)
+    if not path.exists():
+        return {"cached": False}
+    return {"cached": True, "sha256": _sha256_file(path), "size": path.stat().st_size}
+
+
+@app.put("/api/yolo/models/{model_id}")
+async def upload_yolo_model(model_id: str, weights: UploadFile = File(...), sha256: str = Form(...)) -> dict[str, Any]:
+    path = _yolo_model_path(model_id)
+    if not (weights.filename or "").lower().endswith(".onnx"):
+        raise HTTPException(status_code=400, detail="Only ONNX models are accepted.")
+    YOLO_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(".onnx.partial")
+    digest = hashlib.sha256()
+    size = 0
+    with partial.open("wb") as handle:
+        while chunk := await weights.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_YOLO_MODEL_BYTES:
+                handle.close()
+                partial.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Model file is too large.")
+            digest.update(chunk)
+            handle.write(chunk)
+    if not hmac.compare_digest(digest.hexdigest(), (sha256 or "").lower()):
+        partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Model checksum mismatch.")
+    partial.replace(path)
+    with _yolo_lock:
+        _yolo_models.pop(model_id, None)
+    return {"cached": True, "sha256": digest.hexdigest(), "size": size}
+
+
+@app.delete("/api/yolo/models/{model_id}")
+def delete_yolo_model(model_id: str) -> dict[str, bool]:
+    path = _yolo_model_path(model_id)
+    with _yolo_lock:
+        _yolo_models.pop(model_id, None)
+    path.unlink(missing_ok=True)
+    return {"deleted": True}
+
+
+def _class_names(names: Any) -> list[str]:
+    if isinstance(names, dict):
+        return [str(names[key]) for key in sorted(names)]
+    if isinstance(names, (list, tuple)):
+        return [str(name) for name in names]
+    return []
+
+
+def _run_yolo_predict(model_id: str, temp_path: Path, pil_image: Image.Image, conf: float) -> dict[str, Any]:
+    model = _get_yolo_model(model_id)
+    try:
+        with _inference_lock:
+            results = model.predict(source=str(temp_path), conf=conf, verbose=False)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    width, height = pil_image.size
+    detections: list[dict[str, Any]] = []
+    class_names: list[str] = []
+    for result in results or []:
+        class_names = _class_names(getattr(result, "names", {})) or class_names
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            continue
+        # Normalized outputs are independent of the downscaled inference image.
+        xyxyn = getattr(boxes, "xyxyn", None)
+        rows = np.asarray(xyxyn.detach().cpu().numpy() if hasattr(xyxyn, "detach") else xyxyn) if xyxyn is not None else np.zeros((0, 4))
+        classes = _tensor_list(getattr(boxes, "cls", None), int)
+        scores = _tensor_list(getattr(boxes, "conf", None), float)
+        masks_obj = getattr(result, "masks", None)
+        polygons = getattr(masks_obj, "xyn", None) if masks_obj is not None else None
+        polygons = list(polygons) if polygons is not None else []
+        for index, (x1, y1, x2, y2) in enumerate(rows.reshape(-1, 4).tolist()):
+            x1, y1, x2, y2 = (max(0.0, min(1.0, value)) for value in (x1, y1, x2, y2))
+            segment: list[float] = []
+            if index < len(polygons):
+                points = np.asarray(polygons[index]).reshape(-1, 2)
+                segment = [max(0.0, min(1.0, float(value))) for value in points.reshape(-1).tolist()]
+            class_index = classes[index] if index < len(classes) else 0
+            detections.append({
+                "id": f"det-{index}",
+                "classIndex": class_index,
+                "className": class_names[class_index] if 0 <= class_index < len(class_names) else str(class_index),
+                "score": scores[index] if index < len(scores) else 1.0,
+                "yoloBox": {"cx": (x1 + x2) / 2, "cy": (y1 + y2) / 2, "width": x2 - x1, "height": y2 - y1},
+                "yoloSegments": [segment] if len(segment) >= 6 else [],
+            })
+    return {"width": width, "height": height, "count": len(detections), "classNames": class_names, "detections": detections}
+
+
+@app.post("/api/yolo/predict")
+async def yolo_predict(
+    image: UploadFile = File(...),
+    model_id: str = Form(...),
+    conf: float = Form(0.25),
+) -> dict[str, Any]:
+    if not 0.01 <= conf <= 0.95:
+        raise HTTPException(status_code=400, detail="Confidence must be between 0.01 and 0.95.")
+    _yolo_model_path(model_id)
+    content = await image.read()
+    temp_path, pil_image = await run_in_threadpool(_image_to_temp_file, image, content)
+    try:
+        return await run_in_threadpool(_run_yolo_predict, model_id, temp_path, pil_image, conf)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass

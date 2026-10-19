@@ -1,0 +1,8 @@
+# Endpoint tests run with stubbed models: no torch, ultralytics or GPU needed.
+fastapi>=0.141.1
+python-multipart>=0.0.32
+pillow>=12.0.0
+opencv-python-headless>=4.10.0
+numpy>=2.2.0
+httpx>=0.27
+pytest>=8.0

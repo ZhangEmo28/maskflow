@@ -52,6 +52,7 @@ public sealed class MaskFlowStore
         Seed(state);
         SyncTaskJobStatuses(state);
         HashLegacySessionTokens(state);
+        RequeueInterruptedBatchTasks(state);
         repository.SaveChangesAsync(loaded.RequiresFullWrite ? null : loaded.State, state).GetAwaiter().GetResult();
         Volatile.Write(ref published, state);
     }
@@ -601,6 +602,10 @@ public sealed class MaskFlowStore
             copied = new Project(newProjectId, userId, nextName, current.Description, current.DataType, current.Split, 0, 0, now, now);
             State.Projects.Add(copied);
             State.ProjectLabels[copied.Id] = GetProjectLabels(userId, sourceProjectId).ToList();
+            if (State.ProjectLabelPrompts.TryGetValue(sourceProjectId, out var prompts))
+            {
+                State.ProjectLabelPrompts[copied.Id] = new Dictionary<string, string>(prompts, StringComparer.OrdinalIgnoreCase);
+            }
 
             var fileIdMap = new Dictionary<int, int>();
             foreach (var sourceFile in sourceFiles)
@@ -669,6 +674,7 @@ public sealed class MaskFlowStore
 
             State.Exports.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
             State.ProjectLabels.Remove(projectId);
+            State.ProjectLabelPrompts.Remove(projectId);
             State.Projects.Remove(project);
             deleted = true;
         });
@@ -735,15 +741,22 @@ public sealed class MaskFlowStore
         return set;
     }
 
-    public async Task<(AnnotationSet Annotation, TaskItem Task)> PersistAutoAnnotationAsync(int userId, AnnotationSaveRequest request, FileItem file, int quotaAmount = 1)
+    public async Task<(AnnotationSet Annotation, TaskItem? Task)> PersistAutoAnnotationAsync(int userId, AnnotationSaveRequest request, FileItem file, int quotaAmount = 1, bool recordTask = true)
     {
         AnnotationSet? set = null;
         TaskItem? completed = null;
         await SaveAsync(() =>
         {
+            if (!State.Files.Any(x => x.Id == file.Id && x.UserId == userId))
+            {
+                throw new BadHttpRequestException("File not found.", 404);
+            }
+
             var existing = GetAnnotationSet(userId, file.Id);
             var merged = AnnotationMerge.KeepConfirmed(existing?.Annotations, request.Annotations);
             set = ApplyAnnotationSet(userId, request with { Annotations = merged });
+            ApplyQuotaConsumption(userId, quotaAmount);
+            if (!recordTask) return;
             var task = CreateTaskCore(userId, "yolo_auto_annotation", $"自动标注 {file.Name}", file.ProjectId, file.Id, 1);
             completed = ApplyTaskUpdate(userId, task.Id, "completed", 1, null, new Dictionary<string, object?>
             {
@@ -751,9 +764,8 @@ public sealed class MaskFlowStore
                 ["annotationCount"] = set.Annotations.Count,
                 ["keptConfirmed"] = merged.Count(x => x.Confirmed)
             });
-            ApplyQuotaConsumption(userId, quotaAmount);
         });
-        return (set!, completed!);
+        return (set!, completed);
     }
 
     public AnnotationSet? GetAnnotationSet(int userId, int fileId) => State.AnnotationSets.FirstOrDefault(x => x.UserId == userId && x.FileId == fileId);
@@ -787,6 +799,7 @@ public sealed class MaskFlowStore
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         State.ProjectLabels[projectId] = cleaned;
+        PruneLabelPrompts(projectId, cleaned);
         return cleaned;
     }
 
@@ -1429,6 +1442,222 @@ public sealed class MaskFlowStore
         return (nodeFound, result);
     }
 
+
+    // ---- SAM 3 label prompts ----
+
+    public Dictionary<string, string> GetLabelPrompts(int userId, string projectId)
+    {
+        GetProjectLabels(userId, projectId);
+        return State.ProjectLabelPrompts.TryGetValue(projectId, out var prompts)
+            ? new Dictionary<string, string>(prompts, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public string PromptForLabel(string projectId, string label) =>
+        State.ProjectLabelPrompts.TryGetValue(projectId, out var prompts) && prompts.TryGetValue(label, out var prompt) && !string.IsNullOrWhiteSpace(prompt)
+            ? prompt
+            : label;
+
+    public async Task<Dictionary<string, string>> SaveLabelPromptsAsync(int userId, string projectId, IReadOnlyDictionary<string, string?>? prompts)
+    {
+        Dictionary<string, string>? saved = null;
+        await SaveAsync(() =>
+        {
+            var labels = GetProjectLabels(userId, projectId);
+            var requested = new Dictionary<string, string?>(prompts ?? new Dictionary<string, string?>(), StringComparer.OrdinalIgnoreCase);
+            var next = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var label in labels)
+            {
+                var prompt = requested.TryGetValue(label, out var value) ? value?.Trim() : null;
+                if (string.IsNullOrEmpty(prompt) || prompt.Equals(label, StringComparison.Ordinal)) continue;
+                if (prompt.Length > 100) throw new BadHttpRequestException($"提示词过长：{label}（最多 100 个字符）。", 400);
+                next[label] = prompt;
+            }
+
+            // Replace (never mutate) the inner dictionary so the snapshot diff sees the change.
+            if (next.Count == 0) State.ProjectLabelPrompts.Remove(projectId);
+            else State.ProjectLabelPrompts[projectId] = next;
+            saved = next;
+        });
+        return saved!;
+    }
+
+    void PruneLabelPrompts(string projectId, IReadOnlyCollection<string> labels)
+    {
+        if (!State.ProjectLabelPrompts.TryGetValue(projectId, out var prompts)) return;
+        var kept = prompts.Where(x => labels.Contains(x.Key, StringComparer.OrdinalIgnoreCase))
+            .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
+        if (kept.Count == prompts.Count) return;
+        if (kept.Count == 0) State.ProjectLabelPrompts.Remove(projectId);
+        else State.ProjectLabelPrompts[projectId] = kept;
+    }
+
+    // ---- Custom ONNX models ----
+
+    static long MaxModelBytes =>
+        long.TryParse(Environment.GetEnvironmentVariable("MASKFLOW_MAX_MODEL_BYTES"), out var value) && value > 0 ? value : 500L * 1024 * 1024;
+
+    public async Task<AiModel> AddAiModelAsync(User user, IFormFile upload, string? name, string? projectId)
+    {
+        if (!Path.GetExtension(upload.FileName).Equals(".onnx", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new BadHttpRequestException("只支持 ONNX 模型（.onnx）。可用 `yolo export model=best.pt format=onnx` 导出。", 400);
+        }
+
+        if (upload.Length == 0 || upload.Length > MaxModelBytes)
+        {
+            throw new BadHttpRequestException($"模型文件大小需在 1 字节到 {MaxModelBytes / (1024 * 1024)} MB 之间。", 413);
+        }
+
+        projectId = string.IsNullOrWhiteSpace(projectId) ? null : projectId;
+        if (projectId is not null && !State.Projects.Any(x => x.Id == projectId && x.UserId == user.Id))
+        {
+            throw new BadHttpRequestException("Project not found.", 404);
+        }
+
+        EnsureStorageAvailable(GetUser(user.Id)!, upload.Length);
+        string sha256;
+        await using (var hashStream = upload.OpenReadStream())
+        {
+            sha256 = Convert.ToHexString(await SHA256.HashDataAsync(hashStream)).ToLowerInvariant();
+        }
+
+        var modelId = "model_" + Util.Id();
+        var path = await PersistModelAsync(upload, user.Id, modelId);
+        var displayName = string.IsNullOrWhiteSpace(name) ? Path.GetFileNameWithoutExtension(upload.FileName) : name.Trim();
+        var model = new AiModel(modelId, user.Id, projectId, displayName[..Math.Min(displayName.Length, 200)], path, upload.Length, sha256, null, DateTimeOffset.UtcNow);
+        await SaveAsync(() =>
+        {
+            deleteOnRollback.Add(path);
+            var currentUser = GetUser(user.Id)!;
+            EnsureStorageAvailable(currentUser, upload.Length);
+            State.AiModels.Add(model);
+            ReplaceUser(currentUser with { UsedBytes = currentUser.UsedBytes + upload.Length });
+        });
+        return model;
+    }
+
+    async Task<string> PersistModelAsync(IFormFile upload, int userId, string modelId)
+    {
+        if (UseMinio)
+        {
+            var key = $"users/{userId}/models/{modelId}.onnx";
+            await using var stream = upload.OpenReadStream();
+            await s3Client.Value.PutObjectAsync(new PutObjectRequest
+            {
+                BucketName = MinioBucket,
+                Key = key,
+                InputStream = stream,
+                ContentType = "application/octet-stream"
+            });
+            return $"minio://{MinioBucket}/{key}";
+        }
+
+        var directory = Path.Combine(StorageRoot, userId.ToString(), "models");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"{modelId}.onnx");
+        await using var target = File.Create(path);
+        await upload.CopyToAsync(target);
+        return path;
+    }
+
+    public async Task<bool> DeleteAiModelAsync(int userId, string modelId)
+    {
+        var deleted = false;
+        await SaveAsync(() =>
+        {
+            var model = State.AiModels.FirstOrDefault(x => x.Id == modelId && x.UserId == userId);
+            if (model is null) return;
+            State.AiModels.Remove(model);
+            deleteAfterCommit.Add(model.Path);
+            var user = GetUser(userId);
+            if (user is not null) ReplaceUser(user with { UsedBytes = Math.Max(0, user.UsedBytes - model.Size) });
+            deleted = true;
+        });
+        return deleted;
+    }
+
+    public Task UpdateAiModelClassNamesAsync(string modelId, List<string> classNames) =>
+        SaveAsync(() =>
+        {
+            var model = State.AiModels.FirstOrDefault(x => x.Id == modelId);
+            if (model is null || (model.ClassNames is not null && model.ClassNames.SequenceEqual(classNames))) return;
+            State.AiModels.Remove(model);
+            State.AiModels.Add(model with { ClassNames = classNames });
+        });
+
+    // ---- Background batch annotation ----
+
+    public const string BatchAnnotationTaskType = "batch_auto_annotation";
+
+    public async Task<TaskItem> CreateBatchAnnotationTaskAsync(int userId, AnnotationBatchRequest request, IReadOnlyList<int> fileIds)
+    {
+        TaskItem? task = null;
+        await SaveAsync(() =>
+        {
+            task = CreateTaskCore(userId, BatchAnnotationTaskType, $"批量自动标注 {fileIds.Count} 张图片", request.ProjectId, null, fileIds.Count,
+                new Dictionary<string, object?>
+                {
+                    ["fileIds"] = fileIds.ToList(),
+                    ["mode"] = request.Mode,
+                    ["conf"] = request.Conf,
+                    ["defaultLabel"] = request.DefaultLabel,
+                    ["modelId"] = request.ModelId
+                });
+            task = ApplyTaskUpdate(userId, task.Id, "queued", 0, null, BatchProgress.Empty.ToResult(fileIds.Count))!;
+        });
+        return task!;
+    }
+
+    public BatchTaskInput? GetBatchInput(TaskItem task)
+    {
+        var job = State.Jobs.FirstOrDefault(x => x.Id == task.JobId);
+        return job is null ? null : BatchTaskInput.From(job.Input);
+    }
+
+    // Moves a queued batch to running. Returns false if it was cancelled or picked up meanwhile.
+    public async Task<bool> TryStartBatchTaskAsync(string taskId)
+    {
+        var started = false;
+        await SaveAsync(() =>
+        {
+            var task = State.Tasks.FirstOrDefault(x => x.Id == taskId);
+            if (task is null || task.Status != "queued") return;
+            ApplyTaskUpdate(task.UserId, task.Id, "running", task.Progress, null);
+            started = true;
+        });
+        return started;
+    }
+
+    // Records progress without overriding a cancellation made by the user in the meantime.
+    public async Task<string?> RecordBatchProgressAsync(string taskId, BatchProgress progress, int total, string? finalStatus = null)
+    {
+        string? status = null;
+        await SaveAsync(() =>
+        {
+            var task = State.Tasks.FirstOrDefault(x => x.Id == taskId);
+            if (task is null) return;
+            var nextStatus = task.Status == "running" && finalStatus is not null ? finalStatus : task.Status;
+            var fraction = total == 0 ? 1 : Math.Round(progress.Processed / (double)total, 4);
+            var error = nextStatus == "failed" ? progress.LastError : task.ErrorMessage;
+            status = ApplyTaskUpdate(task.UserId, task.Id, nextStatus, fraction, error, progress.ToResult(total))!.Status;
+        });
+        return status;
+    }
+
+    static void RequeueInterruptedBatchTasks(MaskFlowState state)
+    {
+        for (var i = 0; i < state.Tasks.Count; i++)
+        {
+            var task = state.Tasks[i];
+            if (task.Type == BatchAnnotationTaskType && task.Status == "running")
+            {
+                state.Tasks[i] = task with { Status = "queued" };
+                SyncJobWithTask(state, state.Tasks[i]);
+            }
+        }
+    }
+
     public async Task<TaskItem> CreateTaskAsync(int userId, string type, string? title, string? projectId, int? fileId, int imageCount)
     {
         TaskItem? task = null;
@@ -1436,9 +1665,9 @@ public sealed class MaskFlowStore
         return task!;
     }
 
-    TaskItem CreateTaskCore(int userId, string type, string? title, string? projectId, int? fileId, int imageCount)
+    TaskItem CreateTaskCore(int userId, string type, string? title, string? projectId, int? fileId, int imageCount, Dictionary<string, object?>? input = null)
     {
-        var job = CreateJobCore(type.Replace("auto_", "sam."), userId, projectId, new Dictionary<string, object?>(), new Dictionary<string, object?>());
+        var job = CreateJobCore(type.Replace("auto_", "sam."), userId, projectId, input ?? new Dictionary<string, object?>(), new Dictionary<string, object?>());
         var task = new TaskItem("task_" + Util.Id(), userId, job.Id, type, title ?? type, projectId, fileId, imageCount, "queued", 0, null, null, DateTimeOffset.UtcNow, null, null);
         State.Tasks.Add(task);
         return task;
@@ -1462,6 +1691,7 @@ public sealed class MaskFlowStore
             Progress = progress,
             ErrorMessage = error,
             Result = result ?? task.Result,
+            StartedAt = status == "running" ? task.StartedAt ?? DateTimeOffset.UtcNow : task.StartedAt,
             FinishedAt = status is "completed" or "failed" or "cancelled" ? DateTimeOffset.UtcNow : null
         };
         State.Tasks.Add(fresh);

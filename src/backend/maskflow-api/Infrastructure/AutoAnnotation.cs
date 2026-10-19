@@ -52,6 +52,82 @@ public static class AutoAnnotationParser
         return new AnnotationSaveRequest(fileId, width, height, items);
     }
 
+    // SAM 3 concept mode: prompts were sent in project-label order, so promptIndex == classId.
+    public static AnnotationSaveRequest ParseConcepts(int fileId, string body, IReadOnlyList<string> projectLabels)
+    {
+        using var document = JsonDocument.Parse(body);
+        var root = document.RootElement;
+        var items = new List<AnnotationItem>();
+        foreach (var mask in Array(root, "masks"))
+        {
+            var index = mask.TryGetProperty("promptIndex", out var prompt) && prompt.ValueKind == JsonValueKind.Number ? prompt.GetInt32() : -1;
+            var label = index >= 0 && index < projectLabels.Count ? projectLabels[index] : null;
+            items.Add(ReadItem(mask, label is null ? -1 : index, label));
+        }
+
+        return new AnnotationSaveRequest(fileId, Int(root, "width"), Int(root, "height"), DeduplicateAcrossLabels(items));
+    }
+
+    // Custom YOLO model: class names are matched to project labels by name (case-insensitive);
+    // unmatched classes stay unassigned so they show up for review instead of being dropped.
+    public static AnnotationSaveRequest ParseModelDetections(int fileId, string body, IReadOnlyList<string> projectLabels, out List<string> classNames)
+    {
+        using var document = JsonDocument.Parse(body);
+        var root = document.RootElement;
+        classNames = Array(root, "classNames").Select(x => x.GetString() ?? "").ToList();
+        var items = new List<AnnotationItem>();
+        foreach (var detection in Array(root, "detections"))
+        {
+            var className = detection.TryGetProperty("className", out var name) ? name.GetString() : null;
+            var classId = MaskFlowStore.ResolveLabelClassId(className, projectLabels);
+            items.Add(ReadItem(detection, classId, classId >= 0 ? projectLabels[classId] : null));
+        }
+
+        return new AnnotationSaveRequest(fileId, Int(root, "width"), Int(root, "height"), items);
+    }
+
+    // The same object can match two prompts ("car" and "truck"); keep the higher-scoring one.
+    public static List<AnnotationItem> DeduplicateAcrossLabels(IEnumerable<AnnotationItem> items, double iou = 0.85)
+    {
+        var kept = new List<AnnotationItem>();
+        foreach (var item in items.OrderByDescending(x => x.Confidence))
+        {
+            if (kept.Any(other => AnnotationMerge.Iou(other.Bbox, item.Bbox) >= iou)) continue;
+            kept.Add(item);
+        }
+
+        return kept;
+    }
+
+    static AnnotationItem ReadItem(JsonElement element, int classId, string? label)
+    {
+        var box = element.GetProperty("yoloBox");
+        List<double>? segment = null;
+        if (element.TryGetProperty("yoloSegments", out var segments) && segments.ValueKind == JsonValueKind.Array)
+        {
+            segment = PickLargestSegment(segments.EnumerateArray()
+                .Where(x => x.ValueKind == JsonValueKind.Array)
+                .Select(x => x.EnumerateArray().Select(value => value.GetDouble()).ToList()));
+        }
+
+        return new AnnotationItem(
+            "ann_" + Util.Id(),
+            classId,
+            label,
+            new YoloBox(Double(box, "cx"), Double(box, "cy"), Double(box, "width"), Double(box, "height")),
+            segment,
+            element.TryGetProperty("score", out var score) && score.ValueKind == JsonValueKind.Number ? score.GetDouble() : 1.0);
+    }
+
+    static IEnumerable<JsonElement> Array(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array ? value.EnumerateArray() : [];
+
+    static int Int(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetInt32() : 0;
+
+    static double Double(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetDouble() : 0;
+
     // A mask split by occlusion yields several contours; keep the one with the largest area.
     public static List<double>? PickLargestSegment(IEnumerable<List<double>> segments)
     {

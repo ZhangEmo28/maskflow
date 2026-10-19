@@ -139,6 +139,13 @@ export function useMaskFlowApp() {
     savedAt: null,
     zoom: 1,
     filter: "all",
+    queueSort: "default",
+    aiMode: localStorage.getItem("maskflow.aiMode") || "",
+    modelId: localStorage.getItem("maskflow.aiModelId") || "",
+    labelPrompts: {},
+    models: [],
+    modelUpload: { name: "", busy: false },
+    batch: null,
     drawMode: false,
     drawingBox: null,
     editDrag: null,
@@ -474,7 +481,200 @@ export function useMaskFlowApp() {
     const data = await apiFetch(`/api/projects/${projectId}/labels`).catch(() => ({ labels: [] }));
     if (projectId !== projects.selectedId) return;
     annotate.labels = data.labels ?? [];
+    annotate.labelPrompts = data.prompts ?? {};
     syncDefaultRunLabel();
+    await Promise.all([loadProjectModels(), resumeBatchTracking()]);
+  }
+
+  // ---- AI mode: SAM 3 label prompts / segment everything / custom ONNX model ----
+
+  function isEnglishPrompt(text) {
+    return /^[\x20-\x7E]+$/.test(String(text || "").trim());
+  }
+
+  function promptForLabel(label) {
+    return annotate.labelPrompts[label] || label;
+  }
+
+  const labelsNeedingPrompt = computed(() => annotate.labels.filter((label) => !isEnglishPrompt(promptForLabel(label))));
+
+  const effectiveAiMode = computed(() => {
+    if (annotate.aiMode === "model" && annotate.models.some((model) => model.id === annotate.modelId)) return "model";
+    if (annotate.aiMode === "concepts" || annotate.aiMode === "everything") return annotate.aiMode;
+    // SAM 3 text prompts are English: default to them once every label has an English prompt.
+    return annotate.labels.length && !labelsNeedingPrompt.value.length ? "concepts" : "everything";
+  });
+
+  const aiModeValue = computed(() => (effectiveAiMode.value === "model" ? `model:${annotate.modelId}` : effectiveAiMode.value));
+
+  function setAiMode(value) {
+    if (String(value).startsWith("model:")) {
+      annotate.aiMode = "model";
+      annotate.modelId = value.slice("model:".length);
+    } else {
+      annotate.aiMode = value;
+    }
+    localStorage.setItem("maskflow.aiMode", annotate.aiMode);
+    localStorage.setItem("maskflow.aiModelId", annotate.modelId);
+  }
+
+  function aiRequestOptions() {
+    const mode = effectiveAiMode.value;
+    return {
+      mode,
+      conf: Number(annotate.conf),
+      defaultLabel: mode === "everything" ? annotate.defaultRunLabel || null : null,
+      modelId: mode === "model" ? annotate.modelId : null
+    };
+  }
+
+  async function saveLabelPrompt(label, value) {
+    if (!projects.selectedId) return;
+    const next = { ...annotate.labelPrompts };
+    const prompt = String(value || "").trim();
+    if (prompt && prompt !== label) next[label] = prompt;
+    else delete next[label];
+    try {
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/label-prompts`, { method: "PUT", body: { prompts: next } });
+      annotate.labelPrompts = data.prompts ?? {};
+      annotate.status = prompt ? `「${label}」将用提示词 “${prompt}” 识别` : `「${label}」改用标签名识别`;
+    } catch (error) {
+      annotate.status = error.message;
+    }
+  }
+
+  async function loadProjectModels() {
+    const projectId = projects.selectedId;
+    if (!projectId) {
+      annotate.models = [];
+      return;
+    }
+    const data = await apiFetch(`/api/models?projectId=${encodeURIComponent(projectId)}`).catch(() => ({ models: [] }));
+    if (projectId !== projects.selectedId) return;
+    annotate.models = data.models ?? [];
+  }
+
+  async function uploadModel(fileList) {
+    const file = fileList?.[0];
+    if (!file || !projects.selectedId) return;
+    if (!/\.onnx$/i.test(file.name)) {
+      annotate.status = "只支持 .onnx 模型，可用 yolo export model=best.pt format=onnx 导出";
+      return;
+    }
+    const form = new FormData();
+    form.append("file", file);
+    form.append("name", annotate.modelUpload.name.trim() || file.name.replace(/\.onnx$/i, ""));
+    form.append("projectId", projects.selectedId);
+    annotate.modelUpload.busy = true;
+    annotate.status = `正在上传模型 ${file.name}`;
+    try {
+      const data = await apiFetch("/api/models", { method: "POST", body: form });
+      annotate.models = [data.model, ...annotate.models];
+      annotate.modelUpload.name = "";
+      setAiMode(`model:${data.model.id}`);
+      if (data.user) {
+        account.value = data.user;
+        saveSession({ ...session(), user: data.user });
+      }
+      annotate.status = `模型 ${data.model.name} 已上传，已切换为用它预标注`;
+    } catch (error) {
+      annotate.status = error.message;
+    } finally {
+      annotate.modelUpload.busy = false;
+    }
+  }
+
+  async function deleteModel(model) {
+    if (!window.confirm(`确定删除模型 ${model.name} 吗？`)) return;
+    try {
+      const data = await apiFetch(`/api/models/${model.id}`, { method: "DELETE" });
+      annotate.models = annotate.models.filter((item) => item.id !== model.id);
+      if (annotate.modelId === model.id) setAiMode("");
+      if (data.user) account.value = data.user;
+      annotate.status = `模型 ${model.name} 已删除`;
+    } catch (error) {
+      annotate.status = error.message;
+    }
+  }
+
+  // ---- Server-side batch annotation ----
+
+  let batchPollTimer = null;
+  const batchActive = computed(() => ["queued", "running"].includes(annotate.batch?.status));
+
+  function applyBatchTask(task) {
+    const result = task.result || {};
+    annotate.batch = {
+      taskId: task.id,
+      projectId: task.projectId,
+      status: task.status,
+      total: result.total ?? task.imageCount ?? 0,
+      processed: result.processed ?? 0,
+      succeeded: result.succeeded ?? 0,
+      failed: result.failed ?? 0,
+      lastError: result.lastError || task.errorMessage || ""
+    };
+  }
+
+  function scheduleBatchPoll() {
+    clearTimeout(batchPollTimer);
+    if (batchActive.value) batchPollTimer = setTimeout(pollBatch, 1500);
+  }
+
+  async function pollBatch() {
+    const batch = annotate.batch;
+    if (!batch) return;
+    try {
+      const data = await apiFetch(`/api/tasks/${batch.taskId}`);
+      if (annotate.batch?.taskId !== batch.taskId) return;
+      applyBatchTask(data.task);
+      if (annotate.batch.processed !== batch.processed) await refreshFiles();
+      if (batchActive.value) scheduleBatchPoll();
+      else await finishBatch();
+    } catch {
+      scheduleBatchPoll();
+    }
+  }
+
+  async function finishBatch() {
+    await Promise.all([refreshFiles(), loadProjectModels()]);
+    const current = annotate.current && files.rows.find((file) => file.id === annotate.current.id);
+    // Reload the open image only when it has no unsaved edits.
+    if (current && !annotate.dirty) await selectAnnotateFile(current);
+    const batch = annotate.batch;
+    if (!batch) return;
+    annotate.status = batch.status === "completed"
+      ? `批量标注完成：成功 ${batch.succeeded} 张${batch.failed ? `，失败 ${batch.failed} 张` : ""}`
+      : batch.status === "cancelled"
+        ? `批量标注已取消，已处理 ${batch.processed} 张`
+        : `批量标注中止：${batch.lastError || "未知错误"}`;
+  }
+
+  async function resumeBatchTracking() {
+    clearTimeout(batchPollTimer);
+    annotate.batch = null;
+    const projectId = projects.selectedId;
+    if (!projectId) return;
+    const data = await apiFetch("/api/tasks").catch(() => ({ tasks: [] }));
+    if (projectId !== projects.selectedId) return;
+    const active = (data.tasks || []).find((task) => task.type === "batch_auto_annotation" && task.projectId === projectId
+      && ["queued", "running"].includes(task.status));
+    if (active) {
+      applyBatchTask(active);
+      scheduleBatchPoll();
+    }
+  }
+
+  async function cancelBatch() {
+    if (!annotate.batch) return;
+    try {
+      const data = await apiFetch(`/api/tasks/${annotate.batch.taskId}/cancel`, { method: "POST" });
+      clearTimeout(batchPollTimer);
+      applyBatchTask(data.task);
+      await finishBatch();
+    } catch (error) {
+      annotate.status = error.message;
+    }
   }
 
   function isUnassignedLabel(label) {
@@ -1411,11 +1611,18 @@ export function useMaskFlowApp() {
   }
 
   const filteredFiles = computed(() => {
-    if (annotate.filter === "annotated") return files.rows.filter((file) => file.annotated);
-    if (annotate.filter === "unannotated") return files.rows.filter((file) => !file.annotated);
-    return files.rows;
+    let rows = files.rows;
+    if (annotate.filter === "annotated") rows = rows.filter((file) => file.annotated);
+    if (annotate.filter === "unannotated") rows = rows.filter((file) => !file.annotated);
+    if (annotate.filter === "review") rows = rows.filter((file) => file.unconfirmedCount > 0);
+    if (annotate.queueSort === "uncertain") {
+      // Active-learning style review: the least certain unreviewed images first.
+      const score = (file) => (file.unconfirmedCount > 0 ? file.minConfidence ?? 1 : 2);
+      rows = [...rows].sort((a, b) => score(a) - score(b) || a.id - b.id);
+    }
+    return rows;
   });
-  const currentFileIndex = computed(() => files.rows.findIndex((file) => file.id === annotate.current?.id));
+  const currentFileIndex = computed(() => filteredFiles.value.findIndex((file) => file.id === annotate.current?.id));
   const activeAnnotation = computed(() => annotate.annotations.find((item) => item.id === annotate.activeId) || null);
   const canRunAnnotateAi = computed(() => annotate.labels.length > 0);
   const annotationStats = computed(() => {
@@ -1638,11 +1845,7 @@ export function useMaskFlowApp() {
     const revision = annotationEditRevision;
     const data = await apiFetch("/api/annotations/auto", {
       method: "POST",
-      body: {
-        fileId: file.id,
-        conf: Number(annotate.conf),
-        defaultLabel: annotate.defaultRunLabel || null
-      }
+      body: { fileId: file.id, ...aiRequestOptions() }
     });
     if (updateCurrent && selection === annotationSelection && revision === annotationEditRevision) applyAnnotation(data.annotation);
     if (data.user) {
@@ -1670,6 +1873,8 @@ export function useMaskFlowApp() {
     try {
       await runMaskForFile(file, { updateCurrent: true });
       await refreshFiles();
+      // A model's class names are learned on first use; refresh so the panel shows them.
+      if (effectiveAiMode.value === "model") await loadProjectModels();
       if (selection !== annotationSelection || revision !== annotationEditRevision) return;
       const refreshed = files.rows.find((item) => item.id === file.id) || file;
       await selectAnnotateFile(refreshed);
@@ -1694,42 +1899,25 @@ export function useMaskFlowApp() {
       annotate.status = "请先添加至少一个项目标签";
       return;
     }
-    let candidates = files.rows.filter((file) => !file.annotated);
-    const skipped = files.rows.length - candidates.length;
-    if (!candidates.length) {
-      if (!window.confirm("所有图片都已有标注。重新运行会替换每张图中未确认的 AI 结果，已人工确认的目标会保留。是否继续？")) return;
-      candidates = [...files.rows];
+    if (batchActive.value) {
+      annotate.status = "已有批量标注任务在进行中";
+      return;
     }
-    if (annotate.dirty && !canLeaveCurrentAnnotation()) return;
-    loading.value = true;
-    const currentId = annotate.current?.id || files.rows[0]?.id;
-    const selection = annotationSelection;
-    const projectId = projects.selectedId;
-    let success = 0;
-    let failed = 0;
+    let scope = "unannotated";
+    if (!files.rows.some((file) => !file.annotated)) {
+      if (!window.confirm("所有图片都已有标注。重新运行会替换每张图中未确认的 AI 结果，已人工确认的目标会保留。是否继续？")) return;
+      scope = "all";
+    }
     try {
-      for (const [index, file] of candidates.entries()) {
-        if (projectId !== projects.selectedId) break;
-        annotate.status = `AI 自动标注中：${index + 1} / ${candidates.length} · ${file.name}`;
-        try {
-          await runMaskForFile(file, { updateCurrent: file.id === currentId });
-          success += 1;
-        } catch {
-          failed += 1;
-        }
-      }
-      await refreshFiles();
-      if (selection !== annotationSelection || projectId !== projects.selectedId) return;
-      const nextCurrent = files.rows.find((file) => file.id === currentId) || files.rows[0];
-      if (nextCurrent) await selectAnnotateFile(nextCurrent);
-      const skippedText = skipped && candidates.length < files.rows.length ? `，跳过 ${skipped} 张已标注图片` : "";
-      annotate.status = failed
-        ? `已完成 ${success} 张，失败 ${failed} 张${skippedText}`
-        : `已完成 ${success} 张图片的自动标注${skippedText}`;
+      const data = await apiFetch("/api/annotations/batch", {
+        method: "POST",
+        body: { projectId: projects.selectedId, scope, ...aiRequestOptions() }
+      });
+      applyBatchTask(data.task);
+      scheduleBatchPoll();
+      annotate.status = `已在服务器排队处理 ${annotate.batch.total} 张图片，可以离开页面，稍后回来查看`;
     } catch (error) {
       annotate.status = error.message;
-    } finally {
-      loading.value = false;
     }
   }
 
@@ -2297,10 +2485,11 @@ export function useMaskFlowApp() {
   }
 
   async function selectAdjacentFile(direction) {
-    if (!files.rows.length) return;
+    const queue = filteredFiles.value;
+    if (!queue.length) return;
     const index = currentFileIndex.value;
-    const nextIndex = Math.max(0, Math.min(files.rows.length - 1, (index < 0 ? 0 : index) + direction));
-    const nextFile = files.rows[nextIndex];
+    const nextIndex = index < 0 ? 0 : Math.max(0, Math.min(queue.length - 1, index + direction));
+    const nextFile = queue[nextIndex];
     if (nextFile && nextFile.id !== annotate.current?.id) await selectAnnotateFile(nextFile);
   }
 
@@ -2572,6 +2761,8 @@ export function useMaskFlowApp() {
     drawingBoxStyle, beginManualBox, updateManualBox, finishManualBox, cancelManualBox, toggleManualDrawMode,
     beginAnnotationEdit, onCanvasPointerDown, onCanvasPointerMove, onCanvasPointerUp, onCanvasPointerCancel,
     onCanvasDoubleClick, onCanvasWheel, undoAnnotationEdit, redoAnnotationEdit,
+    effectiveAiMode, aiModeValue, setAiMode, labelsNeedingPrompt, saveLabelPrompt, uploadModel, deleteModel,
+    batchActive, cancelBatch,
     togglePointPromptMode, setAnnotatePointPolarity, setSegmentPointPolarity, setSegmentPromptMode,
     handleAnnotatePointClick, handleSegmentPointClick, onSegmentImageLoad,
     selectAnnotatePointCandidate, selectSegmentPointCandidate,
