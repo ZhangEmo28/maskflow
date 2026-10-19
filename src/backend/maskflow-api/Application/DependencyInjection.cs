@@ -12,6 +12,8 @@ public static class DependencyInjection
         services.AddHostedService(provider => provider.GetRequiredService<BatchAnnotationWorker>());
         services.AddSingleton<VideoTaskWorker>();
         services.AddHostedService(provider => provider.GetRequiredService<VideoTaskWorker>());
+        services.AddSingleton<TrainingWorker>();
+        services.AddHostedService(provider => provider.GetRequiredService<TrainingWorker>());
         return services;
     }
 }

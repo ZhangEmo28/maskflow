@@ -31,6 +31,7 @@ import {
   projectYoloExportHint
 } from "../lib/yoloFormat";
 import heroPreviewRoad from "../assets/hero-preview-road.png";
+import { useTraining } from "./useTraining";
 
 function createEmptyPointDraft() {
   return {
@@ -52,6 +53,7 @@ export function useMaskFlowApp() {
     "/segment.html": "segment",
     "/annotate.html": "annotate",
     "/export.html": "export",
+    "/train.html": "train",
     "/files.html": "files",
     "/records.html": "records",
     "/billing.html": "billing",
@@ -486,6 +488,7 @@ export function useMaskFlowApp() {
     await loadProjectLabels();
     await refreshFiles();
     if (page.value === "export") await refreshExports();
+    if (page.value === "train") await trainingApi.refreshTraining();
   }
 
   async function deleteCurrentProject() {
@@ -631,6 +634,7 @@ export function useMaskFlowApp() {
 
   const team = reactive({ open: false, owner: null, members: [], invites: [], inviteEmail: "", inviteRole: "annotator", lastInviteUrl: "", busy: false, status: "" });
   const currentRole = computed(() => selectedProject.value?.role || "owner");
+  const trainingApi = useTraining({ projects, selectedProject, currentRole });
   const canEditProject = computed(() => ["owner", "reviewer", "annotator"].includes(currentRole.value));
   const canReviewProject = computed(() => ["owner", "reviewer"].includes(currentRole.value));
   const canManageProject = computed(() => currentRole.value === "owner");
@@ -3018,6 +3022,8 @@ export function useMaskFlowApp() {
       refreshExports();
     }
     if (page.value === "settings" && account.value) loadAccountSettings();
+    if (page.value === "train") refreshProjects().then(trainingApi.refreshTraining);
+    else trainingApi.stopTrainingPoll();
   }
 
 
@@ -3072,7 +3078,8 @@ export function useMaskFlowApp() {
     createExport, exportSplitTotal, validExportConfig, refreshExportAnalysis, applyRecommendedSplit, downloadExportItem, formatDateTime, needsLogin, uploadFiles,
     runSegment, selectSegmentFile, showSegmentOverlay, subscribe, saveSettings, changePassword,
     saveNotifications, createApiToken, revokeApiToken, addTeamMember, removeTeamMember, revokeDevice,
-    refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload, importer, importDataset, downloadFileItem
+    refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload, importer, importDataset, downloadFileItem,
+    ...trainingApi
   };
   for (const [key, value] of Object.entries(providers)) {
     provide(key, value);

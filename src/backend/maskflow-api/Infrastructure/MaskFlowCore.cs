@@ -862,10 +862,20 @@ public sealed partial class MaskFlowStore
                 return;
             }
 
+            if (State.TrainingRuns.Any(x => x.ProjectId == projectId && IsActiveTraining(x)))
+            {
+                throw new BadHttpRequestException("项目还有训练在进行，请先取消训练再删除项目。", 409);
+            }
+
             var fileIds = State.Files.Where(x => x.UserId == userId && x.ProjectId == projectId).Select(x => x.Id).ToList();
             foreach (var fileId in fileIds)
             {
                 DeleteFileCoreLocked(userId, fileId);
+            }
+
+            foreach (var run in State.TrainingRuns.Where(x => x.ProjectId == projectId).ToList())
+            {
+                RemoveTrainingRunLocked(run);
             }
 
             State.Tasks.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
@@ -878,9 +888,16 @@ public sealed partial class MaskFlowStore
             State.ProjectLabels.Remove(projectId);
             State.ProjectLabelPrompts.Remove(projectId);
             State.ProjectMembers.RemoveAll(x => x.ProjectId == projectId);
+            var videoBytes = 0L;
             foreach (var video in State.Videos.Where(x => x.ProjectId == projectId))
             {
                 deleteAfterCommit.Add(video.Path);
+                videoBytes += video.Size;
+            }
+
+            if (videoBytes > 0 && GetUser(userId) is { } owner)
+            {
+                ReplaceUser(owner with { UsedBytes = Math.Max(0, owner.UsedBytes - videoBytes) });
             }
 
             State.Videos.RemoveAll(x => x.ProjectId == projectId);

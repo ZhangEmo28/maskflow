@@ -8,6 +8,7 @@ import SegmentPage from "./components/pages/SegmentPage.vue";
 import FilesPage from "./components/pages/FilesPage.vue";
 import RecordsPage from "./components/pages/RecordsPage.vue";
 import ExportPage from "./components/pages/ExportPage.vue";
+import TrainPage from "./components/pages/TrainPage.vue";
 import BillingPage from "./components/pages/BillingPage.vue";
 import SettingsPage from "./components/pages/SettingsPage.vue";
 
@@ -59,6 +60,7 @@ const {
         <a :class="{ active: page === 'dashboard' }" href="#" @click.prevent="go('/dashboard.html')">控制台</a>
         <a :class="{ active: page === 'annotate' }" href="#" @click.prevent="go('/annotate.html')">AI 标注工具</a>
         <a :class="{ active: page === 'export' }" href="#" @click.prevent="go('/export.html')">数据集</a>
+        <a :class="{ active: page === 'train' }" href="#" @click.prevent="go('/train.html')">模型训练</a>
         <a :class="{ active: page === 'billing' }" href="#" @click.prevent="go('/billing.html')">账单套餐</a>
         <a :class="{ active: page === 'files' }" href="#" @click.prevent="go('/files.html')">图片管理</a>
       </nav>
@@ -78,6 +80,7 @@ const {
       <a :class="{ active: page === 'segment' }" href="#" @click.prevent="go('/segment.html')"><span>S</span>SAM 分割</a>
       <a :class="{ active: page === 'annotate' }" href="#" @click.prevent="go('/annotate.html')"><span>A</span>YOLO 标注</a>
       <a :class="{ active: page === 'export' }" href="#" @click.prevent="go('/export.html')"><span>E</span>数据集导出</a>
+      <a :class="{ active: page === 'train' }" href="#" @click.prevent="go('/train.html')"><span>T</span>模型训练</a>
       <a :class="{ active: page === 'records' }" href="#" @click.prevent="go('/records.html')"><span>R</span>处理记录</a>
       <a :class="{ active: page === 'billing' }" href="#" @click.prevent="go('/billing.html')"><span>B</span>账单套餐</a>
       <a :class="{ active: page === 'settings' }" href="#" @click.prevent="go('/settings.html')"><span>C</span>账户设置</a>
@@ -98,6 +101,7 @@ const {
   <FilesPage v-if="page === 'files'" />
   <RecordsPage v-if="page === 'records'" />
   <ExportPage v-if="page === 'export'" />
+  <TrainPage v-if="page === 'train'" />
   <BillingPage v-if="page === 'billing'" />
   <SettingsPage v-if="page === 'settings'" />
 </template>

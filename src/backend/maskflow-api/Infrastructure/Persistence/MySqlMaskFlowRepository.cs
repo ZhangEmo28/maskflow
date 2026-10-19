@@ -68,6 +68,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadProjectInvitesAsync(connection, state);
         await LoadFileAssignmentsAsync(connection, state);
         await LoadVideosAsync(connection, state);
+        await LoadTrainingRunsAsync(connection, state);
         await LoadFilesAsync(connection, state);
         await LoadAnnotationSetsAsync(connection, state);
         await LoadTasksAsync(connection, state);
@@ -157,6 +158,13 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "fps", "duration_sec", "every_seconds", "frame_file_ids_json", "frame_indexes_json", "status", "error", "created_at"],
                 before.Videos, current.Videos, x => x.Id,
                 x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Fps, x.DurationSec, x.EverySeconds, Json(x.FrameFileIds), Json(x.FrameIndexes), x.Status, x.Error, x.CreatedAt]);
+
+            await ApplyAsync(connection, tx, "training_runs", "id",
+                ["id", "user_id", "project_id", "created_by", "name", "task", "format", "request_json", "status", "epoch", "history_json", "metrics_json",
+                 "artifacts_json", "model_id", "image_count", "error", "created_at", "started_at", "finished_at"],
+                before.TrainingRuns, current.TrainingRuns, x => x.Id,
+                x => [x.Id, x.UserId, x.ProjectId, x.CreatedBy, x.Name, x.Task, x.Format, Json(x.Request), x.Status, x.Epoch, Json(x.History),
+                      x.Metrics is null ? null : x.Metrics.Value.GetRawText(), Json(x.Artifacts), x.ModelId, x.ImageCount, x.Error, x.CreatedAt, x.StartedAt, x.FinishedAt]);
 
             await ApplyAsync(connection, tx, "file_assignments", "file_id",
                 ["file_id", "user_id", "assigned_by", "assigned_at"],
@@ -326,6 +334,12 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         s.Videos.Add(new VideoItem(S(r, "id"), I(r, "user_id"), S(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"),
             Db(r, "fps"), Db(r, "duration_sec"), Db(r, "every_seconds"), FromJson<List<int>>(S(r, "frame_file_ids_json")) ?? [],
             FromJson<List<int>>(S(r, "frame_indexes_json")) ?? [], S(r, "status"), N(r, "error"), D(r, "created_at"))));
+
+    async Task LoadTrainingRunsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM training_runs", r =>
+        s.TrainingRuns.Add(new TrainingRun(S(r, "id"), I(r, "user_id"), S(r, "project_id"), I(r, "created_by"), S(r, "name"), S(r, "task"), S(r, "format"),
+            FromJson<TrainingRequest>(S(r, "request_json"))!, S(r, "status"), I(r, "epoch"), FromJson<List<Dictionary<string, double>>>(S(r, "history_json")) ?? [],
+            N(r, "metrics_json") is { } metrics ? JsonDocument.Parse(metrics).RootElement.Clone() : null, FromJson<List<TrainingArtifact>>(S(r, "artifacts_json")) ?? [],
+            N(r, "model_id"), I(r, "image_count"), N(r, "error"), D(r, "created_at"), ND(r, "started_at"), ND(r, "finished_at"))));
 
     async Task LoadFileAssignmentsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM file_assignments", r =>
         s.FileAssignments.Add(new FileAssignment(I(r, "file_id"), I(r, "user_id"), I(r, "assigned_by"), D(r, "assigned_at"))));
@@ -838,6 +852,30 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           error TEXT NULL,
           created_at DATETIME(6) NOT NULL,
           INDEX ix_videos_project (project_id)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS training_runs (
+          id VARCHAR(64) PRIMARY KEY,
+          user_id INT NOT NULL,
+          project_id VARCHAR(64) NOT NULL,
+          created_by INT NOT NULL,
+          name VARCHAR(255) NOT NULL,
+          task VARCHAR(20) NOT NULL,
+          format VARCHAR(40) NOT NULL,
+          request_json JSON NOT NULL,
+          status VARCHAR(20) NOT NULL,
+          epoch INT NOT NULL,
+          history_json JSON NOT NULL,
+          metrics_json JSON NULL,
+          artifacts_json JSON NOT NULL,
+          model_id VARCHAR(64) NULL,
+          image_count INT NOT NULL,
+          error TEXT NULL,
+          created_at DATETIME(6) NOT NULL,
+          started_at DATETIME(6) NULL,
+          finished_at DATETIME(6) NULL,
+          INDEX ix_training_runs_project (project_id)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """,
         // Column additions go last so their tables exist on a fresh database.

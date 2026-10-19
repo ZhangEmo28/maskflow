@@ -42,6 +42,19 @@ public class MySqlRepositoryIntegrationTests
             await using var weightStream = new MemoryStream(weights);
             var model = await store.AddAiModelAsync(store.GetUser(userId)!, new FormFile(weightStream, 0, weights.Length, "file", "helmet.onnx"), null, project.Id);
             await store.UpdateAiModelClassNamesAsync(model.Id, ["hard hat"]);
+            await store.MutateAsync(state =>
+            {
+                state.TrainingRuns.Add(new TrainingRun("train_it", userId, project.Id, userId, "安全帽 v1", "segment", "yolo-segment",
+                    new TrainingRequest("yolo11n-seg.pt", Split: new SplitConfig(70, 20, 10)), "training", 0, [], null, [], null, 449, null,
+                    DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null));
+                return true;
+            });
+            await store.UpdateTrainingRunAsync("train_it", run => run with
+            {
+                Status = "completed", Epoch = 2, History = [new() { ["epoch"] = 1 }, new() { ["epoch"] = 2, ["metrics/mAP50(M)"] = 0.5 }],
+                Metrics = System.Text.Json.JsonDocument.Parse("""{"val":{"overall":{"metrics/mAP50-95(M)":0.31}},"names":["安全帽"]}""").RootElement.Clone(),
+                Artifacts = [new TrainingArtifact("best.pt", "/tmp/it-best.pt", 10)], ModelId = model.Id
+            });
 
             var reloaded = new MaskFlowStore(new MySqlMaskFlowRepository(builder.ConnectionString));
             reloaded.Initialize();
@@ -60,6 +73,11 @@ public class MySqlRepositoryIntegrationTests
             var reloadedModel = Assert.Single(state.AiModels);
             Assert.Equal(["hard hat"], reloadedModel.ClassNames);
             Assert.Equal(model.Sha256, reloadedModel.Sha256);
+            var training = Assert.Single(state.TrainingRuns);
+            Assert.Equal(("completed", 2, 0.5, model.Id), (training.Status, training.Epoch, training.History[1]["metrics/mAP50(M)"], training.ModelId));
+            Assert.Equal(0.31, MaskFlowStore.TrainingHeadline(training)["mAP50-95"]);
+            Assert.Equal(("yolo11n-seg.pt", 20), (training.Request.BaseWeight, training.Request.Split!.Val));
+            Assert.Equal("best.pt", Assert.Single(training.Artifacts).Name);
             File.Delete(model.Path);
         }
         finally

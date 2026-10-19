@@ -33,6 +33,36 @@ services:
       retries: 12
     restart: unless-stopped
 
+  # 模型训练（可选，需要 GPU）：docker compose --profile training up -d
+  # 基础权重（yolo11n.pt、yolo11n-seg.pt、yolo11n-cls.pt 等）预先下载到 ./资源/训练权重
+  trainer:
+    profiles: ["training"]
+    build:
+      context: ./src/ai/sam-inference
+      dockerfile: Dockerfile
+    image: maskflow-sam-inference:latest
+    container_name: maskflow-trainer
+    command: ["uvicorn", "app.trainer:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      SAM3_INTERNAL_KEY: ${SAM3_INTERNAL_KEY:-maskflow-local-development-sam-key}
+      SAM3_REQUIRE_INTERNAL_KEY: ${SAM3_REQUIRE_INTERNAL_KEY:-true}
+      TRAIN_WEIGHTS_DIR: /weights
+      TRAIN_RUNS_DIR: /runs
+      YOLO_CONFIG_DIR: /runs/.ultralytics
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./资源/训练权重:/weights:ro
+      - maskflow-train-runs:/runs
+    gpus: all
+    shm_size: "8gb"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   minio:
     image: minio/minio:latest
     container_name: maskflow-minio
@@ -81,6 +111,7 @@ services:
       MASKFLOW_ADMIN_API_KEY: ${MASKFLOW_ADMIN_API_KEY:-maskflow-local-development-admin-key}
       MASKFLOW_CORS_ORIGINS: ${MASKFLOW_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       SAM_SERVICE_URL: http://sam-inference:8001
+      TRAINER_SERVICE_URL: http://trainer:8002
       MASKFLOW_STORAGE: /data/storage
       MASKFLOW_MYSQL: Server=mysql;Port=3306;Database=maskflow;User ID=maskflow;Password=${MYSQL_PASSWORD};Allow User Variables=true;
       MASKFLOW_MINIO_ENDPOINT: http://minio:9000
@@ -125,3 +156,5 @@ volumes:
     name: maskflow-mysql-data
   maskflow-api-data:
     name: maskflow-api-data
+  maskflow-train-runs:
+    name: maskflow-train-runs

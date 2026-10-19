@@ -124,6 +124,23 @@ public sealed class AccountMailer(IEmailSender sender, ILogger<AccountMailer> lo
         打开 {PublicUrl}/annotate.html 查看结果。
         """);
 
+    public Task SendTrainingFinishedAsync(string email, string projectName, TrainingRun run)
+    {
+        var outcome = run.Status switch { "completed" => "已完成", "cancelled" => "已取消", _ => "失败" };
+        var headline = MaskFlowStore.TrainingHeadline(run);
+        return SendAsync(email,
+            $"MaskFlow 模型训练{outcome}：{run.Name}",
+            $"""
+            项目「{projectName}」的训练「{run.Name}」{outcome}。
+            基础权重：{run.Request.BaseWeight}，训练 {run.Epoch}/{run.Request.Epochs} 轮，{run.ImageCount} 张图片。
+            {(headline.Count == 0 ? "" : "验证集指标：" + string.Join("，", headline.Select(x => $"{x.Key} {x.Value:0.###}")))}
+            {(run.ModelId is null ? "" : "训练好的模型已加入项目模型列表，可直接用于自动标注。")}
+            {(run.Error is null ? "" : $"说明：{run.Error}")}
+
+            打开 {PublicUrl}/train.html 查看曲线、评估结果和下载权重。
+            """);
+    }
+
     async Task SendAsync(string to, string subject, string body)
     {
         try

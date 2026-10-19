@@ -49,6 +49,12 @@ builder.Services.AddHttpClient("sam", client =>
         ?? builder.Configuration["SamService:Url"]
         ?? "http://localhost:8001");
 }).AddHttpMessageHandler<SamInternalKeyHandler>();
+// Training runs in its own service (same image, separate container) so it never blocks annotation.
+builder.Services.AddHttpClient("trainer", client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(30);
+    client.BaseAddress = new Uri(Environment.GetEnvironmentVariable("TRAINER_SERVICE_URL") ?? "http://localhost:8002");
+}).AddHttpMessageHandler<SamInternalKeyHandler>();
 
 builder.Services.Configure<FormOptions>(options =>
 {
