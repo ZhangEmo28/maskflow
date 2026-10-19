@@ -6,6 +6,7 @@ public sealed class BatchAnnotationWorker(
     MaskFlowStore store,
     AutoAnnotationService annotator,
     SamInferenceGate samGate,
+    AccountMailer mailer,
     ILogger<BatchAnnotationWorker> logger) : BackgroundService
 {
     readonly SemaphoreSlim wake = new(0);
@@ -109,11 +110,24 @@ public sealed class BatchAnnotationWorker(
                 : progress with { Processed = progress.Processed + 1, Failed = progress.Failed + 1, LastError = error };
             var finalStatus = stop ? "failed" : null;
             var status = await store.RecordBatchProgressAsync(task.Id, progress, total, finalStatus);
+            if (status == "failed") await NotifyAsync(task, status, progress);
             if (status != "running") return true;
         }
 
         var outcome = progress.Succeeded == 0 && progress.Failed > 0 ? "failed" : "completed";
         await store.RecordBatchProgressAsync(task.Id, progress, total, outcome);
+        await NotifyAsync(task, outcome, progress);
         return true;
+    }
+
+    // Honours the existing "任务邮件通知" account setting (on by default).
+    async Task NotifyAsync(TaskItem task, string status, BatchProgress progress)
+    {
+        var user = store.GetUser(task.UserId);
+        if (user is null) return;
+        var settings = store.State.NotificationSettings.GetValueOrDefault(user.Id.ToString(), NotificationSettings.Default());
+        if (!settings.EmailTask) return;
+        var projectName = store.State.Projects.FirstOrDefault(x => x.Id == task.ProjectId)?.Name ?? "未命名项目";
+        await mailer.SendBatchFinishedAsync(user.Email, projectName, status, progress);
     }
 }
