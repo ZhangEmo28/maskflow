@@ -103,8 +103,8 @@ public sealed class DatasetSplitterTests
     sealed class MemoryRepository : IMaskFlowRepository
     {
         public Task EnsureSchemaAsync() => Task.CompletedTask;
-        public Task<MaskFlowState?> LoadAsync() => Task.FromResult<MaskFlowState?>(new());
-        public Task SaveAsync(MaskFlowState state, IReadOnlyCollection<string>? syncProjectLabelIds = null) => Task.CompletedTask;
+        public Task<MaskFlowLoadResult> LoadAsync() => Task.FromResult(new MaskFlowLoadResult(new(), false));
+        public Task SaveChangesAsync(MaskFlowState? previous, MaskFlowState current) => Task.CompletedTask;
     }
 
     [Theory]

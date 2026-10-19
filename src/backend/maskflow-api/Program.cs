@@ -8,6 +8,9 @@ using MaskFlow.Api.Infrastructure.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Business errors (4xx) are expected responses; ApiExceptionHandler logs real 5xx failures itself.
+builder.Logging.AddFilter("Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware", LogLevel.None);
+
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.Limits.MaxRequestBodySize = 512L * 1024L * 1024L;

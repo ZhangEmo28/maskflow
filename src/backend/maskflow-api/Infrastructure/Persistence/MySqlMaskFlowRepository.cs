@@ -19,6 +19,11 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         connectionString = configured;
     }
 
+    public MySqlMaskFlowRepository(string connectionString)
+    {
+        this.connectionString = connectionString;
+    }
+
     public async Task EnsureSchemaAsync()
     {
         var builder = new MySqlConnectionStringBuilder(connectionString);
@@ -40,12 +45,16 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         }
     }
 
-    public async Task<MaskFlowState?> LoadAsync()
+    public async Task<MaskFlowLoadResult> LoadAsync()
     {
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
-        if (!await HasAnyDataAsync(connection)) return await TryLoadLegacyStateAsync(connection);
+        if (!await HasAnyDataAsync(connection))
+        {
+            var legacy = await TryLoadLegacyStateAsync(connection);
+            return new MaskFlowLoadResult(legacy, RequiresFullWrite: true);
+        }
 
         var state = new MaskFlowState();
         await LoadCountersAsync(connection, state);
@@ -69,132 +78,128 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadExportsAsync(connection, state);
         await LoadQuotasAsync(connection, state);
         await LoadNotificationsAsync(connection, state);
-        return state;
+        return new MaskFlowLoadResult(state, RequiresFullWrite: false);
     }
 
-    public async Task SaveAsync(MaskFlowState state, IReadOnlyCollection<string>? syncProjectLabelIds = null)
+    // Writes only what differs between the last persisted snapshot and the new one.
+    // previous == null means "write everything" (first boot from a legacy JSON state).
+    public async Task SaveChangesAsync(MaskFlowState? previous, MaskFlowState current)
     {
+        var before = previous ?? new MaskFlowState();
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
         await using var tx = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted);
 
         try
         {
-            await UpsertAsync(connection, tx, "app_counters",
-                ["id", "next_user_id", "next_file_id", "next_event_id"],
-                [1, state.NextUserId, state.NextFileId, state.NextEventId]);
-
-            await PruneExceptAsync(connection, tx, "users", "id", state.Users.Select(x => x.Id));
-            foreach (var x in state.Users)
-                await UpsertAsync(connection, tx, "users",
-                    ["id", "email", "password_hash", "salt", "plan", "quota_bytes", "used_bytes", "created_at", "username", "phone", "avatar_path"],
-                    [x.Id, x.Email, x.PasswordHash, x.Salt, x.Plan, x.QuotaBytes, x.UsedBytes, x.CreatedAt, x.Username, x.Phone, x.AvatarPath]);
-
-            await PruneExceptAsync(connection, tx, "sessions", "token", state.Sessions.Select(x => x.Token));
-            foreach (var x in state.Sessions)
-                await UpsertAsync(connection, tx, "sessions", ["token", "user_id", "created_at", "expires_at", "device_id"], [x.Token, x.UserId, x.CreatedAt, x.ExpiresAt, x.DeviceId]);
-
-            await PruneExceptAsync(connection, tx, "projects", "id", state.Projects.Select(x => x.Id));
-            foreach (var x in state.Projects)
-                await UpsertAsync(connection, tx, "projects",
-                    ["id", "user_id", "name", "description", "data_type", "split_json", "image_count", "annotation_count", "created_at", "updated_at"],
-                    [x.Id, x.UserId, x.Name, x.Description, x.DataType, Json(x.Split), x.ImageCount, x.AnnotationCount, x.CreatedAt, x.UpdatedAt]);
-
-            if (syncProjectLabelIds is { Count: > 0 })
+            if (previous is null
+                || before.NextUserId != current.NextUserId
+                || before.NextFileId != current.NextFileId
+                || before.NextEventId != current.NextEventId)
             {
-                await SyncProjectLabelsAsync(connection, tx, state, syncProjectLabelIds);
+                await UpsertRowsAsync(connection, tx, "app_counters",
+                    ["id", "next_user_id", "next_file_id", "next_event_id"],
+                    [[1, current.NextUserId, current.NextFileId, current.NextEventId]]);
             }
 
-            await PruneExceptAsync(connection, tx, "files", "id", state.Files.Select(x => x.Id));
-            foreach (var x in state.Files)
-                await UpsertAsync(connection, tx, "files",
-                    ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "kind", "content_type", "created_at", "download_url"],
-                    [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Kind, x.ContentType, x.CreatedAt, x.DownloadUrl]);
+            await ApplyAsync(connection, tx, "users", "id",
+                ["id", "email", "password_hash", "salt", "plan", "quota_bytes", "used_bytes", "created_at", "username", "phone", "avatar_path"],
+                before.Users, current.Users, x => x.Id,
+                x => [x.Id, x.Email, x.PasswordHash, x.Salt, x.Plan, x.QuotaBytes, x.UsedBytes, x.CreatedAt, x.Username, x.Phone, x.AvatarPath]);
 
-            await PruneExceptAsync(connection, tx, "annotation_sets", "id", state.AnnotationSets.Select(x => x.Id));
-            foreach (var x in state.AnnotationSets)
-                await UpsertAsync(connection, tx, "annotation_sets",
-                    ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at"],
-                    [x.Id, x.UserId, x.FileId, x.Width, x.Height, Json(x.Annotations), x.YoloTxt, x.CreatedAt, x.UpdatedAt]);
+            await ApplyAsync(connection, tx, "sessions", "token",
+                ["token", "user_id", "created_at", "expires_at", "device_id"],
+                before.Sessions, current.Sessions, x => x.Token,
+                x => [x.Token, x.UserId, x.CreatedAt, x.ExpiresAt, x.DeviceId]);
 
-            await PruneExceptAsync(connection, tx, "tasks", "id", state.Tasks.Select(x => x.Id));
-            foreach (var x in state.Tasks)
-                await UpsertAsync(connection, tx, "tasks",
-                    ["id", "user_id", "job_id", "type", "title", "project_id", "file_id", "image_count", "status", "progress", "result_json", "error_message", "created_at", "started_at", "finished_at"],
-                    [x.Id, x.UserId, x.JobId, x.Type, x.Title, x.ProjectId, x.FileId, x.ImageCount, x.Status, x.Progress, JsonOrNull(x.Result), x.ErrorMessage, x.CreatedAt, x.StartedAt, x.FinishedAt]);
+            await ApplyAsync(connection, tx, "projects", "id",
+                ["id", "user_id", "name", "description", "data_type", "split_json", "image_count", "annotation_count", "created_at", "updated_at"],
+                before.Projects, current.Projects, x => x.Id,
+                x => [x.Id, x.UserId, x.Name, x.Description, x.DataType, Json(x.Split), x.ImageCount, x.AnnotationCount, x.CreatedAt, x.UpdatedAt]);
 
-            await PruneExceptAsync(connection, tx, "jobs", "id", state.Jobs.Select(x => x.Id));
-            foreach (var x in state.Jobs)
-                await UpsertAsync(connection, tx, "jobs",
-                    ["id", "app", "type", "user_id", "project_id", "pool", "priority", "status", "resources_json", "input_json", "output_json", "params_json", "node_id", "reserved_credits", "charged_credits", "error", "created_at", "started_at", "finished_at"],
-                    [x.Id, x.App, x.Type, x.UserId, x.ProjectId, x.Pool, x.Priority, x.Status, Json(x.Resources), Json(x.Input), JsonOrNull(x.Output), Json(x.Params), x.NodeId, x.ReservedCredits, x.ChargedCredits, x.Error, x.CreatedAt, x.StartedAt, x.FinishedAt]);
+            await ApplyProjectLabelsAsync(connection, tx, before.ProjectLabels, current.ProjectLabels);
 
-            await PruneExceptAsync(connection, tx, "job_events", "id", state.JobEvents.Select(x => x.Id));
-            foreach (var x in state.JobEvents)
-                await UpsertAsync(connection, tx, "job_events", ["id", "job_id", "event_type", "payload_json", "created_at"], [x.Id, x.JobId, x.EventType, Json(x.Payload), x.CreatedAt]);
+            await ApplyAsync(connection, tx, "files", "id",
+                ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "kind", "content_type", "created_at", "download_url"],
+                before.Files, current.Files, x => x.Id,
+                x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Kind, x.ContentType, x.CreatedAt, x.DownloadUrl]);
 
-            await PruneExceptAsync(connection, tx, "nodes", "id", state.Nodes.Select(x => x.Id));
-            foreach (var x in state.Nodes)
-                await UpsertAsync(connection, tx, "nodes",
-                    ["id", "owner_id", "pool", "status", "gpu_model", "vram_gb", "region", "price_per_hour", "reputation", "api_key", "created_at", "approved_at", "last_heartbeat"],
-                    [x.Id, x.OwnerId, x.Pool, x.Status, x.GpuModel, x.VramGb, x.Region, x.PricePerHour, x.Reputation, x.ApiKey, x.CreatedAt, x.ApprovedAt, x.LastHeartbeat]);
+            await ApplyAsync(connection, tx, "annotation_sets", "id",
+                ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at"],
+                before.AnnotationSets, current.AnnotationSets, x => x.Id,
+                x => [x.Id, x.UserId, x.FileId, x.Width, x.Height, Json(x.Annotations), x.YoloTxt, x.CreatedAt, x.UpdatedAt]);
 
-            await PruneExceptAsync(connection, tx, "pools", "id", state.Pools.Select(x => x.Id));
-            foreach (var x in state.Pools)
-                await UpsertAsync(connection, tx, "pools",
-                    ["id", "name", "type", "region", "status", "capacity_json", "policy_json", "created_at", "updated_at"],
-                    [x.Id, x.Name, x.Type, x.Region, x.Status, Json(x.Capacity), Json(x.Policy), x.CreatedAt, x.UpdatedAt]);
+            await ApplyAsync(connection, tx, "tasks", "id",
+                ["id", "user_id", "job_id", "type", "title", "project_id", "file_id", "image_count", "status", "progress", "result_json", "error_message", "created_at", "started_at", "finished_at"],
+                before.Tasks, current.Tasks, x => x.Id,
+                x => [x.Id, x.UserId, x.JobId, x.Type, x.Title, x.ProjectId, x.FileId, x.ImageCount, x.Status, x.Progress, JsonOrNull(x.Result), x.ErrorMessage, x.CreatedAt, x.StartedAt, x.FinishedAt]);
 
-            await PruneExceptAsync(connection, tx, "pricing_rules", "id", state.PricingRules.Select(x => x.Id));
-            foreach (var x in state.PricingRules)
-                await UpsertAsync(connection, tx, "pricing_rules",
-                    ["id", "name", "resource_type", "pool", "region", "unit_price", "billing_unit", "status", "effective_at", "updated_at"],
-                    [x.Id, x.Name, x.ResourceType, x.Pool, x.Region, x.UnitPrice, x.BillingUnit, x.Status, x.EffectiveAt, x.UpdatedAt]);
+            await ApplyAsync(connection, tx, "jobs", "id",
+                ["id", "app", "type", "user_id", "project_id", "pool", "priority", "status", "resources_json", "input_json", "output_json", "params_json", "node_id", "reserved_credits", "charged_credits", "error", "created_at", "started_at", "finished_at"],
+                before.Jobs, current.Jobs, x => x.Id,
+                x => [x.Id, x.App, x.Type, x.UserId, x.ProjectId, x.Pool, x.Priority, x.Status, Json(x.Resources), Json(x.Input), JsonOrNull(x.Output), Json(x.Params), x.NodeId, x.ReservedCredits, x.ChargedCredits, x.Error, x.CreatedAt, x.StartedAt, x.FinishedAt]);
 
-            await PruneExceptAsync(connection, tx, "wallet_ledger", "id", state.WalletLedger.Select(x => x.Id));
-            foreach (var x in state.WalletLedger)
-                await UpsertAsync(connection, tx, "wallet_ledger", ["id", "user_id", "delta", "reason", "job_id", "created_at"], [x.Id, x.UserId, x.Delta, x.Reason, x.JobId, x.CreatedAt]);
+            await ApplyAsync(connection, tx, "job_events", "id",
+                ["id", "job_id", "event_type", "payload_json", "created_at"],
+                before.JobEvents, current.JobEvents, x => x.Id,
+                x => [x.Id, x.JobId, x.EventType, Json(x.Payload), x.CreatedAt]);
 
-            await PruneExceptAsync(connection, tx, "settlements", "id", state.Settlements.Select(x => x.Id));
-            foreach (var x in state.Settlements)
-                await UpsertAsync(connection, tx, "settlements",
-                    ["id", "provider_id", "period", "node_count", "gross_amount", "platform_fee", "net_amount", "status", "created_at", "paid_at"],
-                    [x.Id, x.ProviderId, x.Period, x.NodeCount, x.GrossAmount, x.PlatformFee, x.NetAmount, x.Status, x.CreatedAt, x.PaidAt]);
+            await ApplyAsync(connection, tx, "nodes", "id",
+                ["id", "owner_id", "pool", "status", "gpu_model", "vram_gb", "region", "price_per_hour", "reputation", "api_key", "created_at", "approved_at", "last_heartbeat"],
+                before.Nodes, current.Nodes, x => x.Id,
+                x => [x.Id, x.OwnerId, x.Pool, x.Status, x.GpuModel, x.VramGb, x.Region, x.PricePerHour, x.Reputation, x.ApiKey, x.CreatedAt, x.ApprovedAt, x.LastHeartbeat]);
 
-            await PruneExceptAsync(connection, tx, "api_tokens", "id", state.ApiTokens.Select(x => x.Id));
-            foreach (var x in state.ApiTokens)
-                await UpsertAsync(connection, tx, "api_tokens",
-                    ["id", "user_id", "name", "token_hash", "token_prefix", "created_at", "last_used_at", "revoked_at"],
-                    [x.Id, x.UserId, x.Name, x.TokenHash, x.TokenPrefix, x.CreatedAt, x.LastUsedAt, x.RevokedAt]);
+            await ApplyAsync(connection, tx, "pools", "id",
+                ["id", "name", "type", "region", "status", "capacity_json", "policy_json", "created_at", "updated_at"],
+                before.Pools, current.Pools, x => x.Id,
+                x => [x.Id, x.Name, x.Type, x.Region, x.Status, Json(x.Capacity), Json(x.Policy), x.CreatedAt, x.UpdatedAt]);
 
-            await PruneExceptAsync(connection, tx, "team_members", "id", state.TeamMembers.Select(x => x.Id));
-            foreach (var x in state.TeamMembers)
-                await UpsertAsync(connection, tx, "team_members", ["id", "user_id", "email", "role", "status", "created_at"], [x.Id, x.UserId, x.Email, x.Role, x.Status, x.CreatedAt]);
+            await ApplyAsync(connection, tx, "pricing_rules", "id",
+                ["id", "name", "resource_type", "pool", "region", "unit_price", "billing_unit", "status", "effective_at", "updated_at"],
+                before.PricingRules, current.PricingRules, x => x.Id,
+                x => [x.Id, x.Name, x.ResourceType, x.Pool, x.Region, x.UnitPrice, x.BillingUnit, x.Status, x.EffectiveAt, x.UpdatedAt]);
 
-            await PruneExceptAsync(connection, tx, "account_devices", "id", state.Devices.Select(x => x.Id));
-            foreach (var x in state.Devices)
-                await UpsertAsync(connection, tx, "account_devices",
-                    ["id", "user_id", "name", "ip", "user_agent", "created_at", "last_seen_at", "revoked_at"],
-                    [x.Id, x.UserId, x.Name, x.Ip, x.UserAgent, x.CreatedAt, x.LastSeenAt, x.RevokedAt]);
+            await ApplyAsync(connection, tx, "wallet_ledger", "id",
+                ["id", "user_id", "delta", "reason", "job_id", "created_at"],
+                before.WalletLedger, current.WalletLedger, x => x.Id,
+                x => [x.Id, x.UserId, x.Delta, x.Reason, x.JobId, x.CreatedAt]);
 
-            await PruneExceptAsync(connection, tx, "dataset_exports", "id", state.Exports.Select(x => x.Id));
-            foreach (var x in state.Exports)
-                await UpsertAsync(connection, tx, "dataset_exports",
-                    ["id", "user_id", "project_id", "task_id", "status", "object_path", "size_bytes", "config_json", "created_at", "finished_at", "error_message", "download_url"],
-                    [x.Id, x.UserId, x.ProjectId, x.TaskId, x.Status, x.Path, x.Size, Json(x.Config), x.CreatedAt, x.FinishedAt, x.ErrorMessage, x.DownloadUrl]);
+            await ApplyAsync(connection, tx, "settlements", "id",
+                ["id", "provider_id", "period", "node_count", "gross_amount", "platform_fee", "net_amount", "status", "created_at", "paid_at"],
+                before.Settlements, current.Settlements, x => x.Id,
+                x => [x.Id, x.ProviderId, x.Period, x.NodeCount, x.GrossAmount, x.PlatformFee, x.NetAmount, x.Status, x.CreatedAt, x.PaidAt]);
 
-            await PruneExceptAsync(connection, tx, "ai_quotas", "user_id", state.Quotas.Keys.Select(int.Parse));
-            foreach (var pair in state.Quotas)
-                await UpsertAsync(connection, tx, "ai_quotas", ["user_id", "plan", "daily_limit", "daily_used", "daily_reset_at"], [int.Parse(pair.Key), pair.Value.Plan, pair.Value.DailyLimit, pair.Value.DailyUsed, pair.Value.DailyResetAt.ToDateTime(TimeOnly.MinValue)]);
+            await ApplyAsync(connection, tx, "api_tokens", "id",
+                ["id", "user_id", "name", "token_hash", "token_prefix", "created_at", "last_used_at", "revoked_at"],
+                before.ApiTokens, current.ApiTokens, x => x.Id,
+                x => [x.Id, x.UserId, x.Name, x.TokenHash, x.TokenPrefix, x.CreatedAt, x.LastUsedAt, x.RevokedAt]);
 
-            await PruneExceptAsync(connection, tx, "notification_settings", "user_id", state.NotificationSettings.Keys.Select(int.Parse));
-            foreach (var pair in state.NotificationSettings)
-            {
-                var x = pair.Value;
-                await UpsertAsync(connection, tx, "notification_settings",
-                    ["user_id", "email_task", "email_billing", "browser_notice", "weekly_report", "updated_at"],
-                    [int.Parse(pair.Key), x.EmailTask, x.EmailBilling, x.BrowserNotice, x.WeeklyReport, x.UpdatedAt]);
-            }
+            await ApplyAsync(connection, tx, "team_members", "id",
+                ["id", "user_id", "email", "role", "status", "created_at"],
+                before.TeamMembers, current.TeamMembers, x => x.Id,
+                x => [x.Id, x.UserId, x.Email, x.Role, x.Status, x.CreatedAt]);
+
+            await ApplyAsync(connection, tx, "account_devices", "id",
+                ["id", "user_id", "name", "ip", "user_agent", "created_at", "last_seen_at", "revoked_at"],
+                before.Devices, current.Devices, x => x.Id,
+                x => [x.Id, x.UserId, x.Name, x.Ip, x.UserAgent, x.CreatedAt, x.LastSeenAt, x.RevokedAt]);
+
+            await ApplyAsync(connection, tx, "dataset_exports", "id",
+                ["id", "user_id", "project_id", "task_id", "status", "object_path", "size_bytes", "config_json", "created_at", "finished_at", "error_message", "download_url"],
+                before.Exports, current.Exports, x => x.Id,
+                x => [x.Id, x.UserId, x.ProjectId, x.TaskId, x.Status, x.Path, x.Size, Json(x.Config), x.CreatedAt, x.FinishedAt, x.ErrorMessage, x.DownloadUrl]);
+
+            var quotas = StateDiff.Compare(before.Quotas, current.Quotas);
+            await DeleteKeysAsync(connection, tx, "ai_quotas", "user_id", quotas.Deletes.Select(int.Parse));
+            await UpsertRowsAsync(connection, tx, "ai_quotas",
+                ["user_id", "plan", "daily_limit", "daily_used", "daily_reset_at"],
+                quotas.Upserts.Select(pair => new object?[] { int.Parse(pair.Key), pair.Value.Plan, pair.Value.DailyLimit, pair.Value.DailyUsed, pair.Value.DailyResetAt.ToDateTime(TimeOnly.MinValue) }));
+
+            var notifications = StateDiff.Compare(before.NotificationSettings, current.NotificationSettings);
+            await DeleteKeysAsync(connection, tx, "notification_settings", "user_id", notifications.Deletes.Select(int.Parse));
+            await UpsertRowsAsync(connection, tx, "notification_settings",
+                ["user_id", "email_task", "email_billing", "browser_notice", "weekly_report", "updated_at"],
+                notifications.Upserts.Select(pair => new object?[] { int.Parse(pair.Key), pair.Value.EmailTask, pair.Value.EmailBilling, pair.Value.BrowserNotice, pair.Value.WeeklyReport, pair.Value.UpdatedAt }));
 
             await tx.CommitAsync();
         }
@@ -311,65 +316,77 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         while (await reader.ReadAsync()) read(reader);
     }
 
-    async Task UpsertAsync(MySqlConnection connection, MySqlTransaction tx, string table, string[] columns, object?[] values)
+    const int RowsPerStatement = 200;
+
+    async Task ApplyAsync<T, TKey>(MySqlConnection connection, MySqlTransaction tx, string table, string keyColumn, string[] columns,
+        IEnumerable<T> previous, IEnumerable<T> current, Func<T, TKey> key, Func<T, object?[]> values)
+        where T : class
+        where TKey : notnull
     {
-        await using var command = connection.CreateCommand();
-        command.Transaction = tx;
+        var changes = StateDiff.Compare(previous, current, key);
+        if (changes.IsEmpty) return;
+        await DeleteKeysAsync(connection, tx, table, keyColumn, changes.Deletes.Cast<object>());
+        await UpsertRowsAsync(connection, tx, table, columns, changes.Upserts.Select(values));
+    }
+
+    static async Task UpsertRowsAsync(MySqlConnection connection, MySqlTransaction tx, string table, string[] columns, IEnumerable<object?[]> rows)
+    {
         var columnNames = string.Join(", ", columns.Select(column => $"`{column}`"));
-        var placeholders = string.Join(", ", columns.Select((_, i) => "@p" + i));
-        var updates = string.Join(", ", columns.Select(column => $"`{column}`=VALUES(`{column}`)"));
-        command.CommandText = $"INSERT INTO `{table}` ({columnNames}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {updates}";
-        for (var i = 0; i < values.Length; i++) command.Parameters.AddWithValue("@p" + i, values[i] ?? DBNull.Value);
-        await command.ExecuteNonQueryAsync();
-    }
-
-    async Task PruneExceptAsync<T>(MySqlConnection connection, MySqlTransaction tx, string table, string keyColumn, IEnumerable<T> keepKeys)
-    {
-        var keys = keepKeys.ToList();
-        await using var command = connection.CreateCommand();
-        command.Transaction = tx;
-        if (keys.Count == 0)
+        var updates = string.Join(", ", columns.Select(column => $"`{column}`=new_row.`{column}`"));
+        foreach (var chunk in rows.Chunk(RowsPerStatement))
         {
-            command.CommandText = $"DELETE FROM `{table}`";
-            await command.ExecuteNonQueryAsync();
-            return;
-        }
-
-        var placeholders = keys.Select((_, i) => "@k" + i).ToArray();
-        command.CommandText = $"DELETE FROM `{table}` WHERE `{keyColumn}` NOT IN ({string.Join(", ", placeholders)})";
-        for (var i = 0; i < keys.Count; i++) command.Parameters.AddWithValue("@k" + i, keys[i]);
-        await command.ExecuteNonQueryAsync();
-    }
-
-    async Task SyncProjectLabelsAsync(MySqlConnection connection, MySqlTransaction tx, MaskFlowState state, IReadOnlyCollection<string> projectIds)
-    {
-        foreach (var projectId in projectIds)
-        {
-            var labels = state.ProjectLabels.TryGetValue(projectId, out var stored) ? stored : [];
-            if (labels.Count == 0)
+            await using var command = connection.CreateCommand();
+            command.Transaction = tx;
+            var groups = new string[chunk.Length];
+            for (var row = 0; row < chunk.Length; row++)
             {
-                await using var clear = connection.CreateCommand();
+                var placeholders = new string[columns.Length];
+                for (var column = 0; column < columns.Length; column++)
+                {
+                    var name = $"@p{row}_{column}";
+                    placeholders[column] = name;
+                    command.Parameters.AddWithValue(name, chunk[row][column] ?? DBNull.Value);
+                }
+
+                groups[row] = $"({string.Join(", ", placeholders)})";
+            }
+
+            command.CommandText = $"INSERT INTO `{table}` ({columnNames}) VALUES {string.Join(", ", groups)} AS new_row ON DUPLICATE KEY UPDATE {updates}";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    static async Task DeleteKeysAsync<TKey>(MySqlConnection connection, MySqlTransaction tx, string table, string keyColumn, IEnumerable<TKey> keys)
+    {
+        foreach (var chunk in keys.Chunk(RowsPerStatement * 5))
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = tx;
+            var placeholders = chunk.Select((_, i) => "@k" + i).ToArray();
+            command.CommandText = $"DELETE FROM `{table}` WHERE `{keyColumn}` IN ({string.Join(", ", placeholders)})";
+            for (var i = 0; i < chunk.Length; i++) command.Parameters.AddWithValue("@k" + i, chunk[i]);
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    static async Task ApplyProjectLabelsAsync(MySqlConnection connection, MySqlTransaction tx,
+        IReadOnlyDictionary<string, List<string>> previous, IReadOnlyDictionary<string, List<string>> current)
+    {
+        var changes = StateDiff.Compare(previous, current);
+        await DeleteKeysAsync(connection, tx, "project_labels", "project_id", changes.Deletes);
+        foreach (var (projectId, labels) in changes.Upserts)
+        {
+            await using (var clear = connection.CreateCommand())
+            {
                 clear.Transaction = tx;
                 clear.CommandText = "DELETE FROM `project_labels` WHERE `project_id` = @project_id";
                 clear.Parameters.AddWithValue("@project_id", projectId);
                 await clear.ExecuteNonQueryAsync();
-                continue;
             }
 
-            await using var prune = connection.CreateCommand();
-            prune.Transaction = tx;
-            var placeholders = labels.Select((_, i) => "@label" + i).ToArray();
-            prune.CommandText = $"DELETE FROM `project_labels` WHERE `project_id` = @project_id AND `label_name` NOT IN ({string.Join(", ", placeholders)})";
-            prune.Parameters.AddWithValue("@project_id", projectId);
-            for (var i = 0; i < labels.Count; i++) prune.Parameters.AddWithValue("@label" + i, labels[i]);
-            await prune.ExecuteNonQueryAsync();
-
-            for (var i = 0; i < labels.Count; i++)
-            {
-                await UpsertAsync(connection, tx, "project_labels",
-                    ["project_id", "label_name", "sort_order"],
-                    [projectId, labels[i], i]);
-            }
+            await UpsertRowsAsync(connection, tx, "project_labels",
+                ["project_id", "label_name", "sort_order"],
+                labels.Select((label, index) => new object?[] { projectId, label, index }));
         }
     }
 

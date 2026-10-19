@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace MaskFlow.Api.Tests;
 
@@ -13,7 +14,10 @@ public class ApiExceptionHandlerTests
 
     static async Task<(int Status, string Detail)> Handle(Exception exception)
     {
-        var context = new DefaultHttpContext();
+        var context = new DefaultHttpContext
+        {
+            RequestServices = new ServiceCollection().AddLogging().BuildServiceProvider()
+        };
         context.Response.Body = new MemoryStream();
         context.Features.Set<IExceptionHandlerFeature>(new Feature(exception));
         await ApiExceptionHandler.HandleAsync(context);
