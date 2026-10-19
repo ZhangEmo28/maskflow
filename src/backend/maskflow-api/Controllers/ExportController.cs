@@ -42,9 +42,10 @@ public sealed class ExportController : MaskFlowControllerBase
     }
 
     [HttpPost("analyze")]
-    public IActionResult Analyze([FromBody] ExportRequest request)
+    public async Task<IActionResult> Analyze([FromBody] ExportRequest request)
     {
         var user = CurrentUser();
+        if (request.GroupNearDuplicates) await Store.EnsurePerceptualHashesAsync(user.Id, request.ProjectId, HttpContext.RequestAborted);
         var plan = DatasetExportPlan.Create(Store.State, user.Id, request);
         return Ok(new { analysis = DatasetAnalysis.Analyze(plan, request.Split ?? new(70, 20, 10), request.Seed) });
     }

@@ -128,9 +128,9 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Sha256, JsonOrNull(x.ClassNames), x.CreatedAt]);
 
             await ApplyAsync(connection, tx, "files", "id",
-                ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "kind", "content_type", "created_at", "download_url"],
+                ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "kind", "content_type", "created_at", "download_url", "phash"],
                 before.Files, current.Files, x => x.Id,
-                x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Kind, x.ContentType, x.CreatedAt, x.DownloadUrl]);
+                x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Kind, x.ContentType, x.CreatedAt, x.DownloadUrl, x.Phash]);
 
             await ApplyAsync(connection, tx, "annotation_sets", "id",
                 ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at"],
@@ -284,7 +284,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         s.AiModels.Add(new AiModel(S(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "sha256"), FromJson<List<string>>(N(r, "class_names_json")), D(r, "created_at"))));
 
     async Task LoadFilesAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM files", r =>
-        s.Files.Add(new FileItem(I(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "kind"), N(r, "content_type"), D(r, "created_at"), S(r, "download_url"))));
+        s.Files.Add(new FileItem(I(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "kind"), N(r, "content_type"), D(r, "created_at"), S(r, "download_url"), N(r, "phash"))));
 
     async Task LoadAnnotationSetsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM annotation_sets", r =>
         s.AnnotationSets.Add(new AnnotationSet(S(r, "id"), I(r, "user_id"), I(r, "file_id"), I(r, "width"), I(r, "height"), FromJson<List<AnnotationItem>>(S(r, "annotations_json")) ?? [], S(r, "yolo_txt"), D(r, "created_at"), D(r, "updated_at"))));
@@ -747,6 +747,8 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           weekly_report BOOLEAN NOT NULL,
           updated_at DATETIME(6) NOT NULL
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
-        """
+        """,
+        // Column additions go last so their tables exist on a fresh database.
+        "ALTER TABLE files ADD COLUMN phash CHAR(16) NULL"
     ];
 }

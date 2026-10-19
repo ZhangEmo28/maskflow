@@ -65,6 +65,25 @@ public sealed class ProjectsController : MaskFlowControllerBase
         return Ok(new { labels = projectService.GetLabels(user.Id, projectId), prompts = Store.GetLabelPrompts(user.Id, projectId) });
     }
 
+    // Import an existing dataset: a zip (images + YOLO/COCO/LabelMe/VOC annotations) or a single
+    // COCO/LabelMe/VOC file whose images were uploaded before. Annotations match images by file name.
+    [HttpPost("{projectId}/import")]
+    public async Task<IActionResult> Import(string projectId)
+    {
+        var user = CurrentUser();
+        var form = await Request.ReadFormAsync();
+        var file = form.Files.FirstOrDefault();
+        if (file is null) return BadRequest(new { detail = "请选择要导入的 zip 或标注文件。" });
+        var options = new ImportOptions(
+            form["format"].FirstOrDefault(),
+            !string.Equals(form["confirmed"].FirstOrDefault(), "false", StringComparison.OrdinalIgnoreCase),
+            form["onExisting"].FirstOrDefault() ?? "skip",
+            !string.Equals(form["importImages"].FirstOrDefault(), "false", StringComparison.OrdinalIgnoreCase));
+        await using var stream = file.OpenReadStream();
+        var summary = await Store.ImportDatasetAsync(user, projectId, stream, file.FileName, options);
+        return Ok(new { summary, user = Store.PublicUser(Store.GetUser(user.Id)!) });
+    }
+
     // English text prompts used by SAM 3 when auto-annotating with project labels.
     [HttpPut("{projectId}/label-prompts")]
     public async Task<IActionResult> SaveLabelPrompts(string projectId, [FromBody] LabelPromptsRequest request)

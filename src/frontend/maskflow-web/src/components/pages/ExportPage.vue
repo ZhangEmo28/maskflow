@@ -22,7 +22,7 @@ const validExportConfig = inject("validExportConfig");
     <section class="work-wrap">
       <header class="work-title">
         <div class="work-title-icon">E</div>
-        <div><h1>数据集导出</h1><p>按 YOLO 目录结构生成训练集、验证集、测试集和配置文件。</p></div>
+        <div><h1>数据集导出</h1><p>按 YOLO、COCO 或 Pascal VOC 格式生成训练集、验证集、测试集。</p></div>
       </header>
       <nav class="billing-proto-tabs work-tabs">
         <a href="#" :class="{ active: exportPage.tab === 'config' }" @click.prevent="exportPage.tab = 'config'">导出配置</a>
@@ -58,6 +58,20 @@ const validExportConfig = inject("validExportConfig");
               <span>分类裁剪</span>
               <small>按标注框裁出目标图，按标签目录归类</small>
             </label>
+            <label :class="{ active: exportPage.format === 'coco' }">
+              <input v-model="exportPage.format" type="radio" value="coco" />
+              <span>COCO</span>
+              <small>instances_*.json，含框与多边形（Detectron2 / MMDetection 可直接用）</small>
+            </label>
+            <label :class="{ active: exportPage.format === 'voc' }">
+              <input v-model="exportPage.format" type="radio" value="voc" />
+              <span>Pascal VOC</span>
+              <small>每张图一个 XML，含 ImageSets 划分</small>
+            </label>
+          </div>
+          <div class="export-options">
+            <label><input v-model="exportPage.confirmedOnly" type="checkbox" /> 只导出人工确认的目标</label>
+            <label><input v-model="exportPage.groupNearDuplicates" type="checkbox" /> 近重复图片放进同一集合（防止训练/测试泄漏）</label>
           </div>
           <div class="export-split-form">
             <label>训练集 train %<input v-model.number="exportPage.split.train" type="number" min="0" max="100" /></label>
@@ -73,7 +87,23 @@ const validExportConfig = inject("validExportConfig");
         </article>
         <article class="work-card wide">
           <h2>目录预览</h2>
-          <pre v-if="exportPage.format !== 'classification-crops'">{{ selectedProject?.name || 'project' }}/
+          <pre v-if="exportPage.format === 'coco'">{{ selectedProject?.name || 'project' }}/
+  images/train
+  images/val
+  images/test
+  annotations/instances_train.json
+  annotations/instances_val.json
+  annotations/instances_test.json
+  split-report.json</pre>
+          <pre v-else-if="exportPage.format === 'voc'">{{ selectedProject?.name || 'project' }}/
+  JPEGImages/
+  Annotations/*.xml
+  ImageSets/Main/train.txt
+  ImageSets/Main/val.txt
+  ImageSets/Main/test.txt
+  labels.txt
+  split-report.json</pre>
+          <pre v-else-if="exportPage.format !== 'classification-crops'">{{ selectedProject?.name || 'project' }}/
   images/train
   images/val
   images/test

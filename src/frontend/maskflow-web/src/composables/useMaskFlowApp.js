@@ -79,6 +79,7 @@ export function useMaskFlowApp() {
   });
   const dashboard = reactive({ projects: [], tasks: [], quota: null });
   const files = reactive({ rows: [], selected: null });
+  const importer = reactive({ format: "auto", onExisting: "skip", confirmed: true, file: null, busy: false, summary: null, error: "" });
   const records = reactive({ rows: [] });
   const projects = reactive({ rows: [], selectedId: "", newName: "", newDataType: "detection", status: "" });
   const exportPage = reactive({
@@ -86,6 +87,8 @@ export function useMaskFlowApp() {
     format: "yolo-detect",
     split: { train: 70, val: 20, test: 10 },
     seed: 42,
+    confirmedOnly: false,
+    groupNearDuplicates: true,
     analysis: null,
     analysisLoading: false,
     analysisError: "",
@@ -2516,7 +2519,14 @@ export function useMaskFlowApp() {
   }
 
   function exportRequest() {
-    return { projectId: projects.selectedId, format: exportPage.format, seed: exportPage.seed, split: { ...exportPage.split } };
+    return {
+      projectId: projects.selectedId,
+      format: exportPage.format,
+      seed: exportPage.seed,
+      split: { ...exportPage.split },
+      confirmedOnly: exportPage.confirmedOnly,
+      groupNearDuplicates: exportPage.groupNearDuplicates
+    };
   }
 
   async function refreshExportAnalysis() {
@@ -2545,7 +2555,8 @@ export function useMaskFlowApp() {
   }
 
   watch(() => [page.value, projects.selectedId, exportPage.format, exportPage.seed,
-    exportPage.split.train, exportPage.split.val, exportPage.split.test], (_, previous, onCleanup) => {
+    exportPage.split.train, exportPage.split.val, exportPage.split.test,
+    exportPage.confirmedOnly, exportPage.groupNearDuplicates], (_, previous, onCleanup) => {
     analysisRequestId++;
     exportPage.analysis = null;
     exportPage.analysisLoading = false;
@@ -2566,6 +2577,41 @@ export function useMaskFlowApp() {
     const query = projects.selectedId ? `?projectId=${encodeURIComponent(projects.selectedId)}` : "";
     const data = await apiFetch(`/api/export${query}`).catch(() => ({ exports: [] }));
     exportPage.rows = data.exports || [];
+  }
+
+  // Import an existing dataset (zip of images + YOLO/COCO/LabelMe/VOC labels, or one annotation file).
+  async function importDataset() {
+    if (!projects.selectedId || !importer.file) return;
+    const form = new FormData();
+    form.append("file", importer.file);
+    form.append("format", importer.format);
+    form.append("onExisting", importer.onExisting);
+    form.append("confirmed", String(importer.confirmed));
+    importer.busy = true;
+    importer.error = "";
+    importer.summary = null;
+    try {
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/import`, { method: "POST", body: form });
+      importer.summary = data.summary;
+      importer.file = null;
+      if (data.user) {
+        account.value = data.user;
+        saveSession({ ...session(), user: data.user });
+      }
+      await Promise.all([refreshProjects(), refreshFiles()]);
+    } catch (error) {
+      importer.error = error.message;
+    } finally {
+      importer.busy = false;
+    }
+  }
+
+  async function downloadFileItem(file) {
+    try {
+      await downloadAuthenticated(file.downloadUrl, file.name);
+    } catch (error) {
+      projects.status = error.message;
+    }
   }
 
   async function downloadExportItem(item) {
@@ -2780,7 +2826,7 @@ export function useMaskFlowApp() {
     createExport, exportSplitTotal, validExportConfig, refreshExportAnalysis, applyRecommendedSplit, downloadExportItem, formatDateTime, needsLogin, uploadFiles,
     runSegment, selectSegmentFile, showSegmentOverlay, subscribe, saveSettings, changePassword,
     saveNotifications, createApiToken, revokeApiToken, addTeamMember, removeTeamMember, revokeDevice,
-    refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload
+    refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload, importer, importDataset, downloadFileItem
   };
   for (const [key, value] of Object.entries(providers)) {
     provide(key, value);

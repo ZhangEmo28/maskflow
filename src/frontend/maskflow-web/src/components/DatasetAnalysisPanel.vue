@@ -59,6 +59,14 @@ const imageCounts = splits => ["train", "val", "test"].map(key => splits[key].im
       <ul v-if="exportPage.analysis.warnings.length" class="dataset-warnings">
         <li v-for="warning in exportPage.analysis.warnings" :key="warning">{{ warning }}</li>
       </ul>
+      <details v-if="exportPage.analysis.nearDuplicateGroups?.length" class="dataset-duplicates">
+        <summary>查看 {{ exportPage.analysis.nearDuplicateGroups.length }} 组近重复图片</summary>
+        <ol>
+          <li v-for="group in exportPage.analysis.nearDuplicateGroups" :key="group[0].fileId">
+            {{ group.map((item) => item.name || ('#' + item.fileId)).join('、') }}
+          </li>
+        </ol>
+      </details>
       <p class="dataset-basis">{{ exportPage.analysis.limitation }}</p>
     </template>
   </section>

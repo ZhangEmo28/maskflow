@@ -6534,3 +6534,94 @@ body:has(.app-sidebar) {
   flex: 0 0 auto;
   white-space: nowrap;
 }
+
+/* Export options, near-duplicate list, dataset import */
+.export-options {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.export-options label,
+.import-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dataset-duplicates {
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.dataset-duplicates ol {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding-left: 22px;
+  color: #475569;
+}
+
+.import-options {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.import-options select {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.import-summary {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  background: #f0fdf4;
+  font-size: 13px;
+}
+
+.import-summary p {
+  margin: 4px 0;
+}
+
+.import-summary ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: #92400e;
+}
+
+.export-options input[type="checkbox"],
+.import-check input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.export-options label,
+.import-check {
+  justify-content: flex-start;
+  text-align: left;
+  font-weight: 600;
+}
+
+.files-side-column {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  min-width: 0;
+}
+
+.import-options .import-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
