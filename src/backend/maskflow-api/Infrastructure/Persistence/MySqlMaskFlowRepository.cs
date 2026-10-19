@@ -69,6 +69,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadFileAssignmentsAsync(connection, state);
         await LoadVideosAsync(connection, state);
         await LoadTrainingRunsAsync(connection, state);
+        await LoadOAuthAsync(connection, state);
         await LoadFilesAsync(connection, state);
         await LoadAnnotationSetsAsync(connection, state);
         await LoadTasksAsync(connection, state);
@@ -165,6 +166,16 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 before.TrainingRuns, current.TrainingRuns, x => x.Id,
                 x => [x.Id, x.UserId, x.ProjectId, x.CreatedBy, x.Name, x.Task, x.Format, Json(x.Request), x.Status, x.Epoch, Json(x.History),
                       x.Metrics is null ? null : x.Metrics.Value.GetRawText(), Json(x.Artifacts), x.ModelId, x.ImageCount, x.Error, x.CreatedAt, x.StartedAt, x.FinishedAt]);
+
+            await ApplyAsync(connection, tx, "oauth_clients", "id",
+                ["id", "name", "redirect_uris_json", "created_at"],
+                before.OAuthClients, current.OAuthClients, x => x.Id,
+                x => [x.Id, x.Name, Json(x.RedirectUris), x.CreatedAt]);
+
+            await ApplyAsync(connection, tx, "oauth_grants", "id",
+                ["id", "client_id", "user_id", "access_token_hash", "access_expires_at", "refresh_token_hash", "refresh_expires_at", "created_at", "revoked_at"],
+                before.OAuthGrants, current.OAuthGrants, x => x.Id,
+                x => [x.Id, x.ClientId, x.UserId, x.AccessTokenHash, x.AccessExpiresAt, x.RefreshTokenHash, x.RefreshExpiresAt, x.CreatedAt, x.RevokedAt]);
 
             await ApplyAsync(connection, tx, "file_assignments", "file_id",
                 ["file_id", "user_id", "assigned_by", "assigned_at"],
@@ -340,6 +351,15 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
             FromJson<TrainingRequest>(S(r, "request_json"))!, S(r, "status"), I(r, "epoch"), FromJson<List<Dictionary<string, double>>>(S(r, "history_json")) ?? [],
             N(r, "metrics_json") is { } metrics ? JsonDocument.Parse(metrics).RootElement.Clone() : null, FromJson<List<TrainingArtifact>>(S(r, "artifacts_json")) ?? [],
             N(r, "model_id"), I(r, "image_count"), N(r, "error"), D(r, "created_at"), ND(r, "started_at"), ND(r, "finished_at"))));
+
+    async Task LoadOAuthAsync(MySqlConnection c, MaskFlowState s)
+    {
+        await ReadAsync(c, "SELECT * FROM oauth_clients", r =>
+            s.OAuthClients.Add(new OAuthClient(S(r, "id"), S(r, "name"), FromJson<List<string>>(S(r, "redirect_uris_json")) ?? [], D(r, "created_at"))));
+        await ReadAsync(c, "SELECT * FROM oauth_grants", r =>
+            s.OAuthGrants.Add(new OAuthGrant(S(r, "id"), S(r, "client_id"), I(r, "user_id"), S(r, "access_token_hash"), D(r, "access_expires_at"),
+                S(r, "refresh_token_hash"), D(r, "refresh_expires_at"), D(r, "created_at"), ND(r, "revoked_at"))));
+    }
 
     async Task LoadFileAssignmentsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM file_assignments", r =>
         s.FileAssignments.Add(new FileAssignment(I(r, "file_id"), I(r, "user_id"), I(r, "assigned_by"), D(r, "assigned_at"))));
@@ -876,6 +896,28 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           started_at DATETIME(6) NULL,
           finished_at DATETIME(6) NULL,
           INDEX ix_training_runs_project (project_id)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+          id VARCHAR(64) PRIMARY KEY,
+          name VARCHAR(120) NOT NULL,
+          redirect_uris_json JSON NOT NULL,
+          created_at DATETIME(6) NOT NULL
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_grants (
+          id VARCHAR(64) PRIMARY KEY,
+          client_id VARCHAR(64) NOT NULL,
+          user_id INT NOT NULL,
+          access_token_hash CHAR(64) NOT NULL,
+          access_expires_at DATETIME(6) NOT NULL,
+          refresh_token_hash CHAR(64) NOT NULL,
+          refresh_expires_at DATETIME(6) NOT NULL,
+          created_at DATETIME(6) NOT NULL,
+          revoked_at DATETIME(6) NULL,
+          INDEX ix_oauth_grants_user (user_id)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """,
         // Column additions go last so their tables exist on a fresh database.

@@ -1,0 +1,109 @@
+using System.ComponentModel;
+using System.Text.Json;
+using ModelContextProtocol;
+using ModelContextProtocol.Protocol;
+using ModelContextProtocol.Server;
+
+[McpServerToolType]
+public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, TrainingWorker trainer)
+{
+    static readonly Dictionary<string, string> Plots = new()
+    {
+        ["confusion_matrix_normalized"] = "confusion_matrix_normalized.png",
+        ["confusion_matrix"] = "confusion_matrix.png",
+        ["results"] = "results.png"
+    };
+
+    [McpServerTool(Name = "start_training", Title = "开始训练", Idempotent = false)]
+    [Description("Train a YOLO model on the project's current annotations, starting from a pre-downloaded base weight (list_base_weights). The run trains, evaluates on val (and test if present) and exports best.pt + ONNX; detect/segment results are registered as a project model for auto annotation. Queued in the background — poll get_training. Owner/reviewer only.")]
+    public Task<object> StartTraining(
+        string project_id,
+        [Description("File name from list_base_weights, e.g. yolo11n.pt")] string base_weight,
+        int epochs = 50,
+        [Description("Training image size")] int image_size = 640,
+        [Description("Batch size; -1 picks automatically from GPU memory")] int batch = 16,
+        [Description("Stop early after this many epochs without improvement")] int patience = 20,
+        [Description("Percent of images for train/val/test; must sum to 100 and val > 0")] int train = 70, int val = 20, int test = 10,
+        [Description("Only use human-confirmed targets")] bool confirmed_only = false,
+        string? name = null) => McpCaller.RunAsync<object>(async () =>
+    {
+        var access = caller.Project(project_id, Permissions.Export);
+        var weights = await trainer.ListWeightsAsync(caller.Aborted);
+        var weight = weights.FirstOrDefault(x => x.Name == base_weight)
+                     ?? throw new McpException($"没有基础权重 {base_weight}。可用：{string.Join("、", weights.Select(x => $"{x.Name}（{x.Task}）"))}");
+        var run = await store.CreateTrainingRunAsync(caller.UserId, access,
+            new TrainingRequest(base_weight, epochs, image_size, batch, patience, new SplitConfig(train, val, test), confirmed_only, Name: name), weight);
+        trainer.Wake();
+        return new { trainingId = run.Id, run.Name, run.Status, run.Format, images = run.ImageCount, next = "用 get_training 查看进度", webUrl = $"{McpCaller.PublicUrl}/train.html" };
+    });
+
+    [McpServerTool(Name = "list_trainings", Title = "训练记录", ReadOnly = true, Idempotent = true)]
+    [Description("Training runs of a project, newest first, with status and headline validation metrics.")]
+    public object ListTrainings(string project_id) => McpCaller.Run(() =>
+    {
+        caller.Project(project_id, Permissions.Read);
+        return new
+        {
+            trainings = store.State.TrainingRuns.Where(x => x.ProjectId == project_id).OrderByDescending(x => x.CreatedAt)
+                .Select(x => new
+                {
+                    x.Id, x.Name, x.Status, x.Task, baseWeight = x.Request.BaseWeight, x.Epoch, epochs = x.Request.Epochs,
+                    metrics = MaskFlowStore.TrainingHeadline(x), x.ModelId, x.Error, x.CreatedAt, x.FinishedAt
+                })
+        };
+    });
+
+    [McpServerTool(Name = "get_training", Title = "训练详情", ReadOnly = true, Idempotent = true)]
+    [Description("Progress and results of a training run: status, epoch, the loss/mAP curve (sampled), final validation and test metrics with per-class mAP, the registered model id and the saved artifacts. Explain the numbers to the user: mAP50-95 is the main score, compare val vs test for overfitting, low per-class scores point at labels that need more or better data.")]
+    public object GetTraining(string training_id) => McpCaller.Run(() =>
+    {
+        var run = caller.Training(training_id, Permissions.Read);
+        // At most ~20 evenly spaced epochs keep the response small while showing the trend.
+        var step = Math.Max(1, (int)Math.Ceiling(run.History.Count / 20.0));
+        var curve = run.History.Where((_, i) => i % step == 0 || i == run.History.Count - 1)
+            .Select(row => row.Where(x => x.Key == "epoch" || x.Key.Contains("loss") || x.Key.StartsWith("metrics/"))
+                .ToDictionary(x => x.Key, x => Math.Round(x.Value, 4)));
+        return new
+        {
+            run.Id, run.Name, run.Status, run.Task, run.Format, run.Request, run.Epoch, run.ImageCount, run.Error,
+            headline = MaskFlowStore.TrainingHeadline(run),
+            curve,
+            evaluation = run.Metrics,
+            run.ModelId,
+            artifacts = run.Artifacts.Select(x => new { x.Name, x.Size }),
+            plots = Plots.Where(x => run.Artifacts.Any(a => a.Name == x.Value)).Select(x => x.Key),
+            run.CreatedAt, run.StartedAt, run.FinishedAt,
+            downloadPage = $"{McpCaller.PublicUrl}/train.html"
+        };
+    });
+
+    [McpServerTool(Name = "cancel_training", Title = "取消训练", Destructive = true, Idempotent = true)]
+    [Description("Cancel a queued or running training. Progress is not kept.")]
+    public Task<object> CancelTraining(string training_id) => McpCaller.RunAsync<object>(async () =>
+    {
+        var run = caller.Training(training_id, Permissions.Export);
+        if (!MaskFlowStore.IsActiveTraining(run)) throw new McpException($"训练已经结束（{run.Status}）。");
+        var cancelled = await trainer.CancelAsync(training_id, caller.Aborted);
+        return new { trainingId = training_id, status = cancelled?.Status ?? store.GetTrainingRun(training_id)?.Status };
+    });
+
+    [McpServerTool(Name = "view_training_plot", Title = "查看训练图表", ReadOnly = true, Idempotent = true)]
+    [Description("Image of a finished training's plot: confusion_matrix_normalized (default; which classes get confused with each other or with background), confusion_matrix (counts) or results (Ultralytics training curves).")]
+    public Task<CallToolResult> ViewTrainingPlot(string training_id, string plot = "confusion_matrix_normalized") => McpCaller.RunAsync(async () =>
+    {
+        var run = caller.Training(training_id, Permissions.Read);
+        if (!Plots.TryGetValue(plot, out var name)) throw new McpException($"plot 只能是：{string.Join("、", Plots.Keys)}");
+        var artifact = run.Artifacts.FirstOrDefault(x => x.Name == name) ?? throw new McpException("这次训练没有这张图（训练未完成或被删除）。");
+        await using var stream = await store.OpenStoredObjectAsync(artifact.Path);
+        using var buffer = new MemoryStream();
+        await stream.CopyToAsync(buffer, caller.Aborted);
+        return new CallToolResult
+        {
+            Content =
+            [
+                ImageContentBlock.FromBytes(buffer.ToArray(), "image/png"),
+                new TextContentBlock { Text = $"{run.Name} 的 {plot}" }
+            ]
+        };
+    });
+}

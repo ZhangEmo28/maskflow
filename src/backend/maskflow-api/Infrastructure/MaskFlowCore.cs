@@ -247,6 +247,11 @@ public sealed partial class MaskFlowStore
             return GetUser(session.UserId);
         }
 
+        if (token.StartsWith("mfo_", StringComparison.Ordinal))
+        {
+            return UserForOAuthAccessToken(tokenHash);
+        }
+
         if (token.StartsWith("mf_", StringComparison.Ordinal))
         {
             var apiToken = State.ApiTokens.FirstOrDefault(x => x.TokenHash == tokenHash && x.RevokedAt is null);
