@@ -11,6 +11,23 @@ public static class DatasetSplitter
             throw new BadHttpRequestException("Split ratios must be between 0 and 100 and sum to 100.", 400);
     }
 
+    // Near-duplicate images (groupOf: fileId -> group root) are split as one unit so the same
+    // scene never lands in both train and val/test.
+    public static Dictionary<int, string> Assign(IReadOnlyList<DatasetSplitSample> samples, SplitConfig split, int seed, IReadOnlyDictionary<int, int>? groupOf)
+    {
+        if (groupOf is null || groupOf.Count == 0) return Assign(samples, split, seed);
+        int Root(int fileId) => groupOf.TryGetValue(fileId, out var root) ? root : fileId;
+        var units = samples
+            .GroupBy(x => Root(x.FileId))
+            .Select(group => new DatasetSplitSample(group.Key, group
+                .SelectMany(x => x.LabelCounts)
+                .GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.Sum(y => y.Value), StringComparer.OrdinalIgnoreCase)))
+            .ToList();
+        var unitSplits = Assign(units, split, seed);
+        return samples.ToDictionary(x => x.FileId, x => unitSplits[Root(x.FileId)]);
+    }
+
     public static Dictionary<int, string> Assign(IReadOnlyList<DatasetSplitSample> samples, SplitConfig split, int seed)
     {
         Validate(split);
@@ -98,8 +115,15 @@ public static class DatasetSplitter
     }
 
     public static object Report(IReadOnlyList<DatasetSplitSample> samples, IReadOnlyList<string> labels,
-        IReadOnlyDictionary<int, string> assignments, SplitConfig split, int seed)
+        IReadOnlyDictionary<int, string> assignments, SplitConfig split, int seed, IReadOnlyDictionary<int, int>? groupOf = null)
     {
+        var nearDuplicateGroups = (groupOf ?? new Dictionary<int, int>())
+            .Where(x => assignments.ContainsKey(x.Key))
+            .GroupBy(x => x.Value)
+            .Select(group => group.Select(x => x.Key).OrderBy(x => x).ToArray())
+            .Where(group => group.Length > 1)
+            .OrderBy(group => group[0])
+            .ToArray();
         int[] ratios = [split.Train, split.Val, split.Test];
         var warnings = new List<string>();
         var classes = labels.Select(label =>
@@ -120,7 +144,8 @@ public static class DatasetSplitter
             images = Names.ToDictionary(name => name, name => assignments.Values.Count(x => x == name)),
             classes, warnings,
             files = assignments.OrderBy(x => x.Key).Select(x => new { fileId = x.Key, split = x.Value }).ToArray(),
-            note = "Source images and their crops stay together. Class coverage takes priority over exact ratios; indivisible groups may prevent exact balance. Separate files of the same subject or near-duplicates are not detected."
+            nearDuplicateGroups,
+            note = "Source images and their crops stay together, and near-duplicate images (perceptual hash) are kept in the same split. Class coverage takes priority over exact ratios; indivisible groups may prevent exact balance. Different photos of the same subject are not detected."
         };
     }
 }

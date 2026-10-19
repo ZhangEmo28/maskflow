@@ -43,10 +43,12 @@ public record ProjectCreate(string Name, string? Description, string? DataType, 
 public record ProjectCopyRequest(string? Name);
 public record ProjectLabelsRequest(List<string> Labels);
 public record TaskCreate(string Type, string? Title, string? ProjectId, int? FileId, int ImageCount = 1);
-public record ExportRequest(string? ProjectId, string? TaskId, SplitConfig? Split, string Format = "yolo", int Seed = 42);
+public record ExportRequest(string? ProjectId, string? TaskId, SplitConfig? Split, string Format = "yolo", int Seed = 42, bool ConfirmedOnly = false, bool GroupNearDuplicates = true);
 public record AnnotationAutoRequest(int FileId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null);
 public record AnnotationBatchRequest(string ProjectId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null, string Scope = "unannotated");
 public record LabelPromptsRequest(Dictionary<string, string?> Prompts);
+public record ImportOptions(string? Format, bool Confirmed = true, string OnExisting = "skip", bool ImportImages = true);
+public record ImportSummary(string Format, int ImagesAdded, int ImagesAnnotated, int AnnotationsImported, int SkippedExisting, List<string> NewLabels, List<string> UnmatchedAnnotations, List<string> Warnings);
 public record AiModel(string Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Sha256, List<string>? ClassNames, DateTimeOffset CreatedAt);
 public record AnnotationPointsRequest(int FileId, List<double[]> Points, List<int> Labels, double Conf = 0.25);
 public record AnnotationSaveRequest(int FileId, int Width, int Height, List<AnnotationItem> Annotations);
@@ -63,7 +65,8 @@ public record User(int Id, string Email, string PasswordHash, string Salt, strin
 public record Session(string Token, int UserId, DateTimeOffset CreatedAt, DateTimeOffset ExpiresAt, string? DeviceId = null);
 public record SplitConfig(int Train, int Val, int Test);
 public record Project(string Id, int UserId, string Name, string Description, string DataType, SplitConfig Split, int ImageCount, int AnnotationCount, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
-public record FileItem(int Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Kind, string? ContentType, DateTimeOffset CreatedAt, string DownloadUrl);
+// Phash: 64-bit difference hash as 16 hex chars ("" = could not be computed, null = not yet computed).
+public record FileItem(int Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Kind, string? ContentType, DateTimeOffset CreatedAt, string DownloadUrl, string? Phash = null);
 public record AnnotationSet(string Id, int UserId, int FileId, int Width, int Height, List<AnnotationItem> Annotations, string YoloTxt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public record AnnotationItem(string Id, int ClassId, string? Label, YoloBox Bbox, List<double>? Segment, double Confidence, bool Confirmed = false);
 public record YoloBox(double Cx, double Cy, double Width, double Height);

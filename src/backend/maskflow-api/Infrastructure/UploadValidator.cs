@@ -45,6 +45,13 @@ public static class UploadValidator
         }
     }
 
+    public static readonly IReadOnlySet<string> ImageExtensions = AllowedExtensions;
+
+    public static long MaxBytes => MaxImageBytes;
+
+    public static bool LooksLikeImage(string fileName, ReadOnlySpan<byte> content) =>
+        AllowedExtensions.Contains(Path.GetExtension(fileName).ToLowerInvariant()) && content.Length >= 3 && IsKnownImageHeader(content[..Math.Min(12, content.Length)]);
+
     static bool IsKnownImageHeader(ReadOnlySpan<byte> header)
     {
         if (header.Length >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF)

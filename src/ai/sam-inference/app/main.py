@@ -607,9 +607,10 @@ def _mask_to_geometry(mask: np.ndarray, width: int, height: int) -> dict[str, An
             "width": max(1, x2 - x1 + 1),
             "height": max(1, y2 - y1 + 1),
         },
+        # Inclusive pixel indices x1..x2 cover the continuous span [x1, x2 + 1).
         "yoloBox": {
-            "cx": ((x1 + x2) / 2) / max(width, 1),
-            "cy": ((y1 + y2) / 2) / max(height, 1),
+            "cx": ((x1 + x2 + 1) / 2) / max(width, 1),
+            "cy": ((y1 + y2 + 1) / 2) / max(height, 1),
             "width": (x2 - x1 + 1) / max(width, 1),
             "height": (y2 - y1 + 1) / max(height, 1),
         },

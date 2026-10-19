@@ -14,6 +14,10 @@ const createProject = inject("createProject");
 const deleteCurrentProject = inject("deleteCurrentProject");
 const uploadFiles = inject("uploadFiles");
 const deleteFile = inject("deleteFile");
+const importer = inject("importer");
+const importDataset = inject("importDataset");
+const downloadFileItem = inject("downloadFileItem");
+const formatDateTime = inject("formatDateTime");
 </script>
 
 <template>
@@ -39,6 +43,7 @@ const deleteFile = inject("deleteFile");
         <button class="btn secondary compact-btn" type="button" :disabled="!projects.selectedId" @click="deleteCurrentProject">删除项目</button>
       </section>
       <section class="work-bottom">
+        <div class="files-side-column">
         <article class="work-card">
           <h2>上传图片</h2>
           <input type="file" multiple accept="image/*" @change="files.selected = $event.target.files" />
@@ -63,6 +68,42 @@ const deleteFile = inject("deleteFile");
           <p v-if="projects.status">{{ projects.status }}</p>
           <p v-if="account">空间：{{ formatBytes(account.usedBytes) }} / {{ formatBytes(account.quotaBytes) }}</p>
         </article>
+        <article class="work-card import-card">
+          <h2>导入已有数据集</h2>
+          <p>上传 zip（图片 + 标注）或单个标注文件。支持 YOLO（txt + data.yaml / classes.txt）、COCO、LabelMe、Pascal VOC，按图片文件名对应；新类别会自动加入项目标签。</p>
+          <div class="import-options">
+            <label>格式
+              <select v-model="importer.format">
+                <option value="auto">自动识别</option>
+                <option value="yolo">YOLO</option>
+                <option value="coco">COCO</option>
+                <option value="labelme">LabelMe</option>
+                <option value="voc">Pascal VOC</option>
+              </select>
+            </label>
+            <label>已有标注的图片
+              <select v-model="importer.onExisting">
+                <option value="skip">跳过，保留现有标注</option>
+                <option value="replace">用导入的标注替换</option>
+              </select>
+            </label>
+            <label class="import-check"><input v-model="importer.confirmed" type="checkbox" /> 导入的标注视为已人工确认</label>
+          </div>
+          <input type="file" accept=".zip,.json,.xml" :disabled="importer.busy" @change="importer.file = $event.target.files[0] || null" />
+          <button class="btn" type="button" :disabled="importer.busy || !importer.file || !projects.selectedId" @click="importDataset">
+            {{ importer.busy ? '正在导入…' : '导入到当前项目' }}
+          </button>
+          <p v-if="importer.error" class="form-error">{{ importer.error }}</p>
+          <div v-if="importer.summary" class="import-summary">
+            <strong>导入完成（{{ importer.summary.format }}）</strong>
+            <p>新增图片 {{ importer.summary.imagesAdded }} 张 · 写入标注 {{ importer.summary.imagesAnnotated }} 张 / {{ importer.summary.annotationsImported }} 个目标<span v-if="importer.summary.skippedExisting"> · 跳过已有标注 {{ importer.summary.skippedExisting }} 张</span></p>
+            <p v-if="importer.summary.newLabels.length">新增标签：{{ importer.summary.newLabels.join('、') }}</p>
+            <ul v-if="importer.summary.warnings.length">
+              <li v-for="warning in importer.summary.warnings" :key="warning">{{ warning }}</li>
+            </ul>
+          </div>
+        </article>
+        </div>
         <article class="work-card wide">
           <h2>文件列表</h2>
           <table>
@@ -71,8 +112,8 @@ const deleteFile = inject("deleteFile");
                 <td>{{ file.name }}</td>
                 <td>{{ formatBytes(file.size) }}</td>
                 <td>{{ file.annotationCount || 0 }} 条标注</td>
-                <td>{{ file.createdAt }}</td>
-                <td><a :href="file.downloadUrl">下载</a> <button class="text-danger" type="button" @click="deleteFile(file.id)">删除</button></td>
+                <td>{{ formatDateTime(file.createdAt) }}</td>
+                <td><a href="#" @click.prevent="downloadFileItem(file)">下载</a> <button class="text-danger" type="button" @click="deleteFile(file.id)">删除</button></td>
               </tr>
               <tr v-if="!files.rows.length"><td colspan="5">当前项目暂无图片文件。</td></tr>
             </tbody>

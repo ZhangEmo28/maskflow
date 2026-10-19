@@ -127,6 +127,9 @@ def test_annotation_masks_report_scores(monkeypatch):
     mask = response.json()["masks"][0]
     assert mask["score"] == pytest.approx(0.77)
     assert mask["yoloBox"]["width"] == pytest.approx(0.3, abs=0.03)
+    # Box edges line up with the pixel grid: left edge = cx - width / 2 lands on a whole pixel.
+    left = (mask["yoloBox"]["cx"] - mask["yoloBox"]["width"] / 2) * 100
+    assert left == pytest.approx(round(left), abs=1e-9)
 
 
 def upload_model(model_id, content, name="best.onnx", sha=None):

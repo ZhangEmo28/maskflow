@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.IO.Compression;
 using System.Runtime.ExceptionServices;
+using System.Xml.Linq;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -18,7 +19,7 @@ public sealed class MaskFlowStore
 {
     readonly SemaphoreSlim gate = new(1, 1);
     readonly IMaskFlowRepository repository;
-    public string StorageRoot { get; } = Environment.GetEnvironmentVariable("MASKFLOW_STORAGE") ?? Path.Combine(AppContext.BaseDirectory, "data", "storage");
+    public string StorageRoot { get; }
     string MinioEndpoint => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_ENDPOINT") ?? "";
     string MinioAccessKey => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_ACCESS_KEY") ?? "";
     string MinioSecretKey => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_SECRET_KEY") ?? "";
@@ -36,9 +37,13 @@ public sealed class MaskFlowStore
 
     sealed record PasswordResetEntry(string TokenHash, DateTimeOffset ExpiresAt);
 
-    public MaskFlowStore(IMaskFlowRepository repository)
+    // storageRoot overrides MASKFLOW_STORAGE (tests use one directory per store).
+    public MaskFlowStore(IMaskFlowRepository repository, string? storageRoot = null)
     {
         this.repository = repository;
+        StorageRoot = storageRoot
+            ?? Environment.GetEnvironmentVariable("MASKFLOW_STORAGE")
+            ?? Path.Combine(AppContext.BaseDirectory, "data", "storage");
         s3Client = new Lazy<AmazonS3Client>(CreateS3Client, LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
@@ -429,6 +434,13 @@ public sealed class MaskFlowStore
     public async Task<FileItem> SaveUploadAsync(User user, IFormFile upload, string? projectId)
     {
         await UploadValidator.ValidateImageAsync(upload);
+        string phash;
+        await using (var hashSource = upload.OpenReadStream())
+        using (var buffer = new MemoryStream())
+        {
+            await hashSource.CopyToAsync(buffer);
+            phash = ImageTools.PerceptualHashHex(buffer.ToArray());
+        }
 
         FileItem? item = null;
         await SaveAsync(async () =>
@@ -449,7 +461,7 @@ public sealed class MaskFlowStore
             var path = await PersistUploadAsync(upload, user.Id, projectId, safeName);
             deleteOnRollback.Add(path);
             var fileId = State.NextFileId++;
-            item = new FileItem(fileId, currentUser.Id, projectId, safeName, path, upload.Length, "image", upload.ContentType, DateTimeOffset.UtcNow, $"/api/files/{fileId}/download");
+            item = new FileItem(fileId, currentUser.Id, projectId, safeName, path, upload.Length, "image", upload.ContentType, DateTimeOffset.UtcNow, $"/api/files/{fileId}/download", phash);
             State.Files.Add(item);
             ReplaceUser(currentUser with { UsedBytes = currentUser.UsedBytes + upload.Length });
         });
@@ -484,6 +496,196 @@ public sealed class MaskFlowStore
         await using var target = File.Create(path);
         await upload.CopyToAsync(target);
         return path;
+    }
+
+    async Task<string> PersistBytesAsync(byte[] bytes, int userId, string projectId, string safeName, string contentType)
+    {
+        var objectKey = $"users/{userId}/projects/{projectId}/uploads/{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Util.Id()}_{safeName}";
+        if (UseMinio)
+        {
+            await s3Client.Value.PutObjectAsync(new PutObjectRequest
+            {
+                BucketName = MinioBucket,
+                Key = objectKey,
+                InputStream = new MemoryStream(bytes),
+                ContentType = contentType
+            });
+            return $"minio://{MinioBucket}/{objectKey}";
+        }
+
+        var userDir = Path.Combine(StorageRoot, userId.ToString(), "projects", projectId);
+        Directory.CreateDirectory(userDir);
+        var path = Path.Combine(userDir, $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Util.Id()}_{safeName}");
+        await File.WriteAllBytesAsync(path, bytes);
+        return path;
+    }
+
+    // ---- Dataset import (YOLO / COCO / LabelMe / VOC, zip or single annotation file) ----
+
+    const int MaxImportEntries = 100_000;
+    const long MaxImportBytes = 8L * 1024 * 1024 * 1024;
+    const long MaxAnnotationFileBytes = 64L * 1024 * 1024;
+
+    static async Task<byte[]> ReadBoundedAsync(Stream source, long limit, string name)
+    {
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await source.ReadAsync(chunk)) > 0)
+        {
+            if (buffer.Length + read > limit) throw new BadHttpRequestException($"{name} 超过大小限制。", 413);
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
+    }
+
+    static string ContentTypeFor(string name) => Path.GetExtension(name).ToLowerInvariant() switch
+    {
+        ".png" => "image/png",
+        ".webp" => "image/webp",
+        ".bmp" => "image/bmp",
+        ".gif" => "image/gif",
+        _ => "image/jpeg"
+    };
+
+    public async Task<ImportSummary> ImportDatasetAsync(User user, string projectId, Stream upload, string uploadName, ImportOptions options)
+    {
+        if (!State.Projects.Any(x => x.Id == projectId && x.UserId == user.Id)) throw new BadHttpRequestException("Project not found.", 404);
+        var onExisting = options.OnExisting == "replace" ? "replace" : "skip";
+        var warnings = new List<string>();
+        var annotationFiles = new List<(string Path, byte[] Bytes)>();
+        var persisted = new List<(string Key, string Name, string Path, long Size, string Phash)>();
+        try
+        {
+            if (uploadName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+            {
+                using var zip = new ZipArchive(upload, ZipArchiveMode.Read);
+                if (zip.Entries.Count > MaxImportEntries) throw new BadHttpRequestException($"压缩包文件数超过 {MaxImportEntries} 个。", 413);
+                var entries = zip.Entries
+                    .Where(x => x.Name.Length > 0 && !x.FullName.StartsWith("__MACOSX/") && !x.Name.StartsWith('.'))
+                    .ToList();
+                foreach (var entry in entries.Where(x => DatasetImportParser.AnnotationExtensions.Contains(Path.GetExtension(x.Name).ToLowerInvariant())))
+                {
+                    await using var stream = entry.Open();
+                    annotationFiles.Add((entry.FullName, await ReadBoundedAsync(stream, MaxAnnotationFileBytes, entry.FullName)));
+                }
+
+                if (options.ImportImages)
+                {
+                    var existingKeys = State.Files
+                        .Where(x => x.UserId == user.Id && x.ProjectId == projectId)
+                        .Select(x => DatasetImportParser.ImageKey(x.Name))
+                        .ToHashSet();
+                    var seen = new HashSet<string>();
+                    long total = 0;
+                    // One image in memory at a time: archives can be several GB.
+                    foreach (var entry in entries.Where(x => UploadValidator.ImageExtensions.Contains(Path.GetExtension(x.Name).ToLowerInvariant())))
+                    {
+                        var key = DatasetImportParser.ImageKey(entry.FullName);
+                        if (existingKeys.Contains(key)) continue;
+                        if (!seen.Add(key))
+                        {
+                            warnings.Add($"重复的图片文件名，已忽略：{entry.FullName}");
+                            continue;
+                        }
+
+                        byte[] bytes;
+                        await using (var stream = entry.Open())
+                        {
+                            bytes = await ReadBoundedAsync(stream, UploadValidator.MaxBytes, entry.FullName);
+                        }
+
+                        total += bytes.Length;
+                        if (total > MaxImportBytes) throw new BadHttpRequestException("压缩包解压后过大。", 413);
+                        if (!UploadValidator.LooksLikeImage(entry.Name, bytes))
+                        {
+                            warnings.Add($"不是有效图片，已跳过：{entry.FullName}");
+                            continue;
+                        }
+
+                        var safeName = Path.GetFileName(entry.Name);
+                        var path = await PersistBytesAsync(bytes, user.Id, projectId, safeName, ContentTypeFor(safeName));
+                        persisted.Add((key, safeName, path, bytes.Length, ImageTools.PerceptualHashHex(bytes)));
+                    }
+                }
+            }
+            else
+            {
+                annotationFiles.Add((uploadName, await ReadBoundedAsync(upload, MaxAnnotationFileBytes * 4, uploadName)));
+            }
+
+            if (annotationFiles.Count == 0 && persisted.Count == 0)
+            {
+                throw new BadHttpRequestException("没有找到可导入的图片或标注文件。", 400);
+            }
+
+            var parsed = annotationFiles.Count > 0
+                ? DatasetImportParser.Parse(annotationFiles, options.Format)
+                : new ImportParseResult("images", [], [], []);
+            warnings.AddRange(parsed.Warnings);
+            return await CommitImportAsync(user.Id, projectId, parsed, persisted, options, onExisting, warnings);
+        }
+        catch
+        {
+            await DeleteStoredObjectsQuietlyAsync(persisted.Select(x => x.Path));
+            throw;
+        }
+    }
+
+    async Task<ImportSummary> CommitImportAsync(int userId, string projectId, ImportParseResult parsed,
+        List<(string Key, string Name, string Path, long Size, string Phash)> persisted, ImportOptions options, string onExisting, List<string> warnings)
+    {
+        ImportSummary? summary = null;
+        await SaveAsync(() =>
+        {
+            deleteOnRollback.AddRange(persisted.Select(x => x.Path));
+            var currentUser = GetUser(userId)!;
+            var addedBytes = persisted.Sum(x => x.Size);
+            EnsureStorageAvailable(currentUser, addedBytes);
+
+            var labels = GetProjectLabels(userId, projectId);
+            var newLabels = parsed.ClassNames.Where(x => x.Length > 0 && !labels.Contains(x, StringComparer.OrdinalIgnoreCase)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            labels = ApplyProjectLabels(userId, projectId, labels.Concat(newLabels));
+
+            var now = DateTimeOffset.UtcNow;
+            foreach (var image in persisted)
+            {
+                var fileId = State.NextFileId++;
+                State.Files.Add(new FileItem(fileId, userId, projectId, image.Name, image.Path, image.Size, "image", ContentTypeFor(image.Name), now, $"/api/files/{fileId}/download", image.Phash));
+            }
+
+            var filesByKey = State.Files
+                .Where(x => x.UserId == userId && x.ProjectId == projectId)
+                .GroupBy(x => DatasetImportParser.ImageKey(x.Name))
+                .ToDictionary(x => x.Key, x => x.OrderBy(file => file.Id).First());
+            int annotated = 0, imported = 0, skipped = 0;
+            var unmatched = new List<string>();
+            foreach (var image in parsed.Images.Values)
+            {
+                if (!filesByKey.TryGetValue(image.Key, out var file))
+                {
+                    unmatched.Add(image.Key);
+                    continue;
+                }
+
+                if (onExisting == "skip" && GetAnnotationSet(userId, file.Id) is not null)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                var items = image.Shapes.Select(shape => new AnnotationItem("ann_" + Util.Id(), -1, shape.Label, shape.Box, shape.Segment, 1.0, options.Confirmed)).ToList();
+                var set = ApplyAnnotationSet(userId, new AnnotationSaveRequest(file.Id, image.Width, image.Height, items));
+                annotated++;
+                imported += set.Annotations.Count;
+            }
+
+            ReplaceUser(currentUser with { UsedBytes = currentUser.UsedBytes + addedBytes });
+            if (unmatched.Count > 0) warnings.Add($"{unmatched.Count} 个标注没有找到同名图片（例如 {string.Join("、", unmatched.Take(5))}），请一起打包图片或先上传图片。");
+            summary = new ImportSummary(parsed.Format, persisted.Count, annotated, imported, skipped, newLabels, unmatched.Take(50).ToList(), warnings.Take(50).ToList());
+        });
+        return summary!;
     }
 
     async Task<string> CopyStoredObjectAsync(string sourcePath, int userId, string projectId, string fileName, string? contentType)
@@ -1096,12 +1298,55 @@ public sealed class MaskFlowStore
             .Where(x => NormalizeDataType(dataType) != "segmentation" || HasValidSegment(x))
             .Select(annotation => BuildYoloLine(annotation, dataType)));
 
+    // Images uploaded before perceptual hashing existed get their hash on first analysis/export.
+    public async Task EnsurePerceptualHashesAsync(int userId, string? projectId, CancellationToken cancellationToken = default)
+    {
+        var missing = State.Files
+            .Where(x => x.UserId == userId && x.Kind == "image" && x.Phash is null && (projectId is null || x.ProjectId == projectId))
+            .ToList();
+        if (missing.Count == 0) return;
+
+        var hashes = new Dictionary<int, string>();
+        foreach (var file in missing)
+        {
+            try
+            {
+                hashes[file.Id] = ImageTools.PerceptualHashHex(await ReadStoredBytesAsync(file.Path, cancellationToken));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or AmazonS3Exception)
+            {
+                hashes[file.Id] = "";
+            }
+        }
+
+        await SaveAsync(() =>
+        {
+            for (var i = 0; i < State.Files.Count; i++)
+            {
+                var file = State.Files[i];
+                if (file.Phash is null && hashes.TryGetValue(file.Id, out var hash))
+                {
+                    State.Files[i] = file with { Phash = hash };
+                }
+            }
+        });
+    }
+
+    async Task<byte[]> ReadStoredBytesAsync(string path, CancellationToken cancellationToken = default)
+    {
+        await using var stream = await OpenStoredObjectAsync(path);
+        using var buffer = new MemoryStream();
+        await stream.CopyToAsync(buffer, cancellationToken);
+        return buffer.ToArray();
+    }
+
     // The archive is built from the committed snapshot without holding the write lock;
     // only registering the finished export is serialized.
     public async Task<DatasetExport> CreateDatasetExportAsync(int userId, ExportRequest request)
     {
         var split = request.Split ?? new SplitConfig(70, 20, 10);
         DatasetSplitter.Validate(split);
+        if (request.GroupNearDuplicates) await EnsurePerceptualHashesAsync(userId, request.ProjectId);
         var plan = DatasetExportPlan.Create(State, userId, request);
         plan.ValidateExport();
 
@@ -1159,11 +1404,19 @@ public sealed class MaskFlowStore
         {
             var labels = plan.Labels;
             var samples = plan.Samples;
-            var assignments = DatasetSplitter.Assign(samples, split, seed);
+            var assignments = DatasetSplitter.Assign(samples, split, seed, plan.GroupOf);
 
             if (exportFormat == "classification-crops")
             {
                 await WriteClassificationCropDatasetAsync(archive, labeledFiles, annotationMap, labels, assignments);
+            }
+            else if (exportFormat == "coco")
+            {
+                await WriteCocoDatasetAsync(archive, plan, assignments);
+            }
+            else if (exportFormat == "voc")
+            {
+                await WriteVocDatasetAsync(archive, plan, assignments);
             }
             else
             {
@@ -1205,22 +1458,149 @@ public sealed class MaskFlowStore
             var reportEntry = archive.CreateEntry("split-report.json");
             await using (var reportStream = reportEntry.Open())
                 await JsonSerializer.SerializeAsync(reportStream,
-                    DatasetSplitter.Report(samples, labels, assignments, split, seed),
+                    DatasetSplitter.Report(samples, labels, assignments, split, seed, plan.GroupOf),
                     new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true });
 
             var readme = archive.CreateEntry("README.md");
             using var readmeWriter = new StreamWriter(readme.Open());
-            readmeWriter.WriteLine(exportFormat == "classification-crops" ? "# MaskFlow Classification Crop Dataset" : "# MaskFlow YOLO Dataset");
+            readmeWriter.WriteLine(exportFormat switch
+            {
+                "classification-crops" => "# MaskFlow Classification Crop Dataset",
+                "coco" => "# MaskFlow COCO Dataset",
+                "voc" => "# MaskFlow Pascal VOC Dataset",
+                _ => "# MaskFlow YOLO Dataset"
+            });
             readmeWriter.WriteLine();
             readmeWriter.WriteLine($"Format: {exportFormat}");
-            readmeWriter.WriteLine($"Task: {(exportFormat == "classification-crops" ? "classify" : yoloTask)}");
+            readmeWriter.WriteLine($"Task: {(exportFormat == "classification-crops" ? "classify" : plan.IsYolo ? yoloTask : exportDataType)}");
+            if (plan.ConfirmedOnly) readmeWriter.WriteLine("Annotations: human-confirmed targets only");
             readmeWriter.WriteLine($"DataType: {exportDataType}");
             readmeWriter.WriteLine($"Images: {labeledFiles.Count}");
-            readmeWriter.WriteLine($"Split: stratified by label, grouped by source image; seed={seed}");
+            readmeWriter.WriteLine($"Split: stratified by label, grouped by source image and near-duplicate group; seed={seed}");
             readmeWriter.WriteLine("See split-report.json for actual per-class image/annotation counts, file assignments and coverage warnings.");
             readmeWriter.WriteLine($"GeneratedAt: {DateTimeOffset.UtcNow:O}");
         }
 
+    }
+
+    static string ExportStem(FileItem file) => SanitizeFileName($"{file.Id}_{Path.GetFileNameWithoutExtension(file.Name)}");
+
+    static (int Width, int Height) ExportSize(AnnotationSet set, byte[] bytes) =>
+        set.Width > 0 && set.Height > 0 ? (set.Width, set.Height) : ImageTools.OrientedSize(bytes);
+
+    // COCO: images/{split}/..., annotations/instances_{split}.json; category ids are 1-based.
+    async Task WriteCocoDatasetAsync(ZipArchive archive, DatasetExportPlan plan, IReadOnlyDictionary<int, string> assignments)
+    {
+        var categories = plan.Labels.Select((name, index) => new { id = index + 1, name, supercategory = "object" }).ToArray();
+        var images = DatasetSplitter.Names.ToDictionary(name => name, _ => new List<object>());
+        var annotations = DatasetSplitter.Names.ToDictionary(name => name, _ => new List<object>());
+        var annotationId = 1;
+        foreach (var file in plan.Files)
+        {
+            var split = assignments[file.Id];
+            var bytes = await ReadStoredBytesAsync(file.Path);
+            var set = plan.Annotations[file.Id];
+            var (width, height) = ExportSize(set, bytes);
+            var fileName = ExportStem(file) + Path.GetExtension(file.Name);
+            await using (var entry = archive.CreateEntry($"images/{split}/{fileName}").Open())
+            {
+                await entry.WriteAsync(bytes);
+            }
+
+            images[split].Add(new { id = file.Id, file_name = fileName, width, height });
+            foreach (var item in set.Annotations.Where(IsExportableAnnotation))
+            {
+                var left = Math.Round(Clamp01(item.Bbox.Cx - item.Bbox.Width / 2) * width, 2);
+                var top = Math.Round(Clamp01(item.Bbox.Cy - item.Bbox.Height / 2) * height, 2);
+                var boxWidth = Math.Round(Clamp01(item.Bbox.Width) * width, 2);
+                var boxHeight = Math.Round(Clamp01(item.Bbox.Height) * height, 2);
+                var hasPolygon = HasValidSegment(item);
+                double[] polygon = hasPolygon
+                    ? item.Segment!.Select((value, index) => Math.Round(value * (index % 2 == 0 ? width : height), 2)).ToArray()
+                    : [];
+                annotations[split].Add(new
+                {
+                    id = annotationId++,
+                    image_id = file.Id,
+                    category_id = item.ClassId + 1,
+                    bbox = new[] { left, top, boxWidth, boxHeight },
+                    area = Math.Round(hasPolygon ? AutoAnnotationParser.PolygonArea(polygon) : boxWidth * boxHeight, 2),
+                    segmentation = hasPolygon ? new[] { polygon } : [],
+                    iscrowd = 0
+                });
+            }
+        }
+
+        foreach (var split in DatasetSplitter.Names)
+        {
+            await using var stream = archive.CreateEntry($"annotations/instances_{split}.json").Open();
+            await JsonSerializer.SerializeAsync(stream, new
+            {
+                info = new { description = "Exported by MaskFlow", date_created = DateTimeOffset.UtcNow.ToString("O") },
+                licenses = Array.Empty<object>(),
+                images = images[split],
+                annotations = annotations[split],
+                categories
+            });
+        }
+    }
+
+    // Pascal VOC: JPEGImages/, Annotations/*.xml (1-based pixel boxes), ImageSets/Main/{split}.txt.
+    async Task WriteVocDatasetAsync(ZipArchive archive, DatasetExportPlan plan, IReadOnlyDictionary<int, string> assignments)
+    {
+        var splitStems = DatasetSplitter.Names.ToDictionary(name => name, _ => new List<string>());
+        foreach (var file in plan.Files)
+        {
+            var bytes = await ReadStoredBytesAsync(file.Path);
+            var set = plan.Annotations[file.Id];
+            var (width, height) = ExportSize(set, bytes);
+            var stem = ExportStem(file);
+            var fileName = stem + Path.GetExtension(file.Name);
+            await using (var entry = archive.CreateEntry($"JPEGImages/{fileName}").Open())
+            {
+                await entry.WriteAsync(bytes);
+            }
+
+            var objects = set.Annotations.Where(IsExportableAnnotation).Select(item =>
+            {
+                var xmin = Math.Clamp((int)Math.Floor(Clamp01(item.Bbox.Cx - item.Bbox.Width / 2) * width) + 1, 1, width);
+                var ymin = Math.Clamp((int)Math.Floor(Clamp01(item.Bbox.Cy - item.Bbox.Height / 2) * height) + 1, 1, height);
+                var xmax = Math.Clamp((int)Math.Ceiling(Clamp01(item.Bbox.Cx + item.Bbox.Width / 2) * width), xmin, width);
+                var ymax = Math.Clamp((int)Math.Ceiling(Clamp01(item.Bbox.Cy + item.Bbox.Height / 2) * height), ymin, height);
+                return new XElement("object",
+                    new XElement("name", item.Label),
+                    new XElement("pose", "Unspecified"),
+                    new XElement("truncated", 0),
+                    new XElement("difficult", 0),
+                    new XElement("bndbox",
+                        new XElement("xmin", xmin),
+                        new XElement("ymin", ymin),
+                        new XElement("xmax", xmax),
+                        new XElement("ymax", ymax)));
+            });
+            var document = new XDocument(new XElement("annotation",
+                new XElement("folder", "JPEGImages"),
+                new XElement("filename", fileName),
+                new XElement("source", new XElement("database", "MaskFlow")),
+                new XElement("size", new XElement("width", width), new XElement("height", height), new XElement("depth", 3)),
+                new XElement("segmented", 0),
+                objects));
+            await using (var entry = archive.CreateEntry($"Annotations/{stem}.xml").Open())
+            {
+                await document.SaveAsync(entry, SaveOptions.None, CancellationToken.None);
+            }
+
+            splitStems[assignments[file.Id]].Add(stem);
+        }
+
+        foreach (var (split, stems) in splitStems)
+        {
+            await using var writer = new StreamWriter(archive.CreateEntry($"ImageSets/Main/{split}.txt").Open());
+            foreach (var stem in stems) await writer.WriteLineAsync(stem);
+        }
+
+        await using var labelWriter = new StreamWriter(archive.CreateEntry("labels.txt").Open());
+        foreach (var label in plan.Labels) await labelWriter.WriteLineAsync(label);
     }
 
     async Task WriteClassificationCropDatasetAsync(

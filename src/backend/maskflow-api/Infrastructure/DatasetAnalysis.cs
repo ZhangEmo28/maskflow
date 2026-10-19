@@ -1,20 +1,29 @@
 public sealed record DatasetExportPlan(
     List<FileItem> AllFiles, List<FileItem> Files, Dictionary<int, AnnotationSet> Annotations,
-    List<string> Labels, List<DatasetSplitSample> Samples, string Format, string DataType)
+    List<string> Labels, List<DatasetSplitSample> Samples, string Format, string DataType,
+    IReadOnlyDictionary<int, int> GroupOf, int ExcludedUnconfirmed, bool ConfirmedOnly, IReadOnlyList<int> OversizedSimilarGroups)
 {
+    public static readonly string[] SupportedFormats = ["yolo", "yolo-detect", "yolo-segment", "classification-crops", "coco", "voc"];
+
+    public static string NormalizeFormat(string? format) => (format ?? "yolo").Trim().ToLowerInvariant() switch
+    {
+        "yolo-detect" or "detect" or "detection" => "yolo-detect",
+        "yolo-segment" or "segment" or "segmentation" => "yolo-segment",
+        "classification" or "classification-crops" or "crops" => "classification-crops",
+        "coco" => "coco",
+        "voc" or "pascal-voc" or "pascal" => "voc",
+        _ => "yolo"
+    };
+
+    public bool IsYolo => Format is "yolo" or "yolo-detect" or "yolo-segment";
+
     public static DatasetExportPlan Create(MaskFlowState state, int userId, ExportRequest request)
     {
         var project = state.Projects.FirstOrDefault(x => x.Id == request.ProjectId && x.UserId == userId);
         if (request.ProjectId is not null && project is null)
             throw new BadHttpRequestException("Project not found.", 404);
-        var format = (request.Format ?? "yolo").Trim().ToLowerInvariant() switch
-        {
-            "yolo-detect" or "detect" or "detection" => "yolo-detect",
-            "yolo-segment" or "segment" or "segmentation" => "yolo-segment",
-            "classification" or "classification-crops" or "crops" => "classification-crops",
-            _ => "yolo"
-        };
-        var dataType = format == "yolo-segment" ? "segmentation" : format == "yolo-detect" ? "detection"
+        var format = NormalizeFormat(request.Format);
+        var dataType = format == "yolo-segment" ? "segmentation" : format is "yolo-detect" or "voc" ? "detection"
             : MaskFlowStore.NormalizeDataType(project?.DataType);
         var files = state.Files.Where(x => x.UserId == userId && x.Kind == "image"
             && (request.ProjectId is null || x.ProjectId == request.ProjectId)).OrderBy(x => x.Id).ToList();
@@ -29,14 +38,35 @@ public sealed record DatasetExportPlan(
         {
             Annotations = MaskFlowStore.NormalizeAnnotations(x.Value.Annotations, labels)
         });
+        var excludedUnconfirmed = 0;
+        if (request.ConfirmedOnly)
+        {
+            excludedUnconfirmed = sets.Values.Sum(x => x.Annotations.Count(a => MaskFlowStore.IsExportableAnnotation(a) && !a.Confirmed));
+            sets = sets.ToDictionary(x => x.Key, x => x.Value with { Annotations = x.Value.Annotations.Where(a => a.Confirmed).ToList() });
+        }
         var exported = files.Where(x => sets.ContainsKey(x.Id)
             && (format != "classification-crops" || sets[x.Id].Annotations.Any(MaskFlowStore.IsExportableAnnotation))).ToList();
         var samples = exported.Select(file => new DatasetSplitSample(file.Id,
             sets[file.Id].Annotations.Where(MaskFlowStore.IsExportableAnnotation)
                 .GroupBy(x => x.Label!, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase))).ToList();
-        return new(files, exported, sets, labels, samples, format, dataType);
+        var similar = request.GroupNearDuplicates
+            ? NearDuplicates.Group(exported.Select(x => (x.Id, x.Phash)))
+            : new Dictionary<int, int>();
+        // A fixed camera can make most frames look alike; forcing such a group into one split
+        // would make the split useless, so very large groups are reported instead of enforced.
+        var maxGroupSize = Math.Max(5, (int)Math.Ceiling(exported.Count * 0.1));
+        var groupSizes = similar.Values.GroupBy(x => x).ToDictionary(x => x.Key, x => x.Count());
+        var groupOf = similar.Where(x => groupSizes[x.Value] <= maxGroupSize).ToDictionary(x => x.Key, x => x.Value);
+        var oversized = groupSizes.Values.Where(size => size > maxGroupSize).OrderByDescending(x => x).ToList();
+        return new(files, exported, sets, labels, samples, format, dataType, groupOf, excludedUnconfirmed, request.ConfirmedOnly, oversized);
     }
+
+    public int[][] NearDuplicateGroups => GroupOf
+        .GroupBy(x => x.Value)
+        .Select(group => group.Select(x => x.Key).OrderBy(x => x).ToArray())
+        .OrderBy(group => group[0])
+        .ToArray();
 
     public int MissingSegments => Files.Sum(file => Annotations[file.Id].Annotations.Count(x =>
         MaskFlowStore.IsExportableAnnotation(x) && !MaskFlowStore.HasValidSegment(x)));
@@ -45,7 +75,8 @@ public sealed record DatasetExportPlan(
     {
         if (Files.Count == 0) throw new BadHttpRequestException("当前项目没有可导出的已标注图片。", 400);
         if (Labels.Count == 0) throw new BadHttpRequestException("请先添加项目标签后再导出。", 400);
-        if (Format != "classification-crops" && DataType == "segmentation" && MissingSegments > 0)
+        // COCO keeps the bbox when a polygon is missing; YOLO segment needs a polygon for every target.
+        if (IsYolo && DataType == "segmentation" && MissingSegments > 0)
             throw new BadHttpRequestException($"有 {MissingSegments} 个已分配标签的目标缺少有效分割轮廓，请补充分割或改用 YOLO 检测格式。", 400);
     }
 }
@@ -70,8 +101,8 @@ public static class DatasetAnalysis
             : min < 50 ? "最少类别为 15–49 张原图，增加验证和测试份额，争取各留出至少 3 张原图；评估仍可能不稳定。"
             : min < 100 ? "最少类别为 50–99 张原图，按 70/20/10 兼顾训练与评估，目标为每类至少约 10 张验证、5 张测试原图。"
             : "每类至少有 100 张原图，按 80/10/10 增加训练份额，同时争取每类至少约 10 张验证及测试原图。";
-        var assigned = DatasetSplitter.Assign(samples, split, seed);
-        var recommended = DatasetSplitter.Assign(samples, recommendation, seed);
+        var assigned = DatasetSplitter.Assign(samples, split, seed, plan.GroupOf);
+        var recommended = DatasetSplitter.Assign(samples, recommendation, seed, plan.GroupOf);
         var max = counts.Count == 0 ? 0 : counts.Values.Max();
         var target = Math.Max(30, (int)Math.Ceiling(max / 3.0));
         var rows = plan.Labels.Select(label =>
@@ -97,9 +128,28 @@ public static class DatasetAnalysis
         if (unannotated > 0) warnings.Add($"有 {unannotated} 张图片尚未保存标注，不会参与本次导出。");
         var unassigned = plan.Annotations.Values.Sum(x => x.Annotations.Count(a => !MaskFlowStore.IsExportableAnnotation(a)));
         if (unassigned > 0) warnings.Add($"有 {unassigned} 个目标未分配有效类别，不会作为训练标签导出。");
-        var unconfirmed = plan.Annotations.Values.Sum(x => x.Annotations.Count(a => MaskFlowStore.IsExportableAnnotation(a) && !a.Confirmed));
-        if (unconfirmed > 0) warnings.Add($"有 {unconfirmed} 个已分配类别的目标尚未人工确认，导出前建议复核。");
-        var blockedSegments = plan.Format != "classification-crops" && plan.DataType == "segmentation" && plan.MissingSegments > 0;
+        var unconfirmed = plan.ConfirmedOnly
+            ? plan.ExcludedUnconfirmed
+            : plan.Annotations.Values.Sum(x => x.Annotations.Count(a => MaskFlowStore.IsExportableAnnotation(a) && !a.Confirmed));
+        if (unconfirmed > 0)
+        {
+            warnings.Add(plan.ConfirmedOnly
+                ? $"已选择只导出人工确认的目标：{unconfirmed} 个未确认目标不会导出。"
+                : $"有 {unconfirmed} 个已分配类别的目标尚未人工确认，导出前建议复核。");
+        }
+
+        var duplicateGroups = plan.NearDuplicateGroups;
+        if (duplicateGroups.Length > 0)
+        {
+            warnings.Add($"发现 {duplicateGroups.Length} 组近重复图片（共 {duplicateGroups.Sum(x => x.Length)} 张），划分时同组图片会放进同一集合，避免训练集和测试集“看过同一张图”。");
+        }
+
+        if (plan.OversizedSimilarGroups.Count > 0)
+        {
+            warnings.Add($"有 {plan.OversizedSimilarGroups.Sum()} 张图片彼此高度相似（可能来自固定机位或连拍），数量太多未强制放进同一集合；如需避免训练/测试泄漏，请按拍摄批次分别建项目或手动划分。");
+        }
+
+        var blockedSegments = plan.IsYolo && plan.DataType == "segmentation" && plan.MissingSegments > 0;
         if (blockedSegments) warnings.Add($"有 {plan.MissingSegments} 个目标缺少有效轮廓，分割导出暂不可用；请补充分割或改用检测格式。");
         int[] ratios = [split.Train, split.Val, split.Test];
         foreach (var row in rows)
@@ -113,10 +163,15 @@ public static class DatasetAnalysis
             seed, requestedSplit = split, recommendedSplit = recommendation, recommendationReason = reason,
             recommendationAvailable = samples.Count > 0 && plan.Labels.Count > 0,
             supplementBasis = $"补样参考目标为每类至少 {target} 张原图：取 30 与最多类别原图数的三分之一中的较大值。这是可调整的采集起点，不是训练达标线。优先增加不同批次、光照、角度和困难场景的真实图片，重复裁剪不能替代独立样本。",
-            limitation = "建议只基于已保存标签统计，未经模型训练验证，不代表最优比例。同一原图不会跨集合，但不同文件中的同一对象、连续帧或近重复图片仍需按拍摄批次人工隔离。多标签共现时实际比例可能偏离目标；原图占比之和可超过 100%。",
+            limitation = "建议只基于已保存标签统计，未经模型训练验证，不代表最优比例。同一原图不会跨集合，按感知哈希识别出的近重复图片也会放进同一集合；但同一对象换角度拍摄的不同照片无法自动识别，仍需按拍摄批次人工隔离。多标签共现时实际比例可能偏离目标；原图占比之和可超过 100%。",
             classes = rows, warnings,
-            preview = DatasetSplitter.Report(samples, plan.Labels, assigned, split, seed),
-            recommendedPreview = DatasetSplitter.Report(samples, plan.Labels, recommended, recommendation, seed)
+            nearDuplicateGroups = duplicateGroups.Select(group => group.Select(id => new
+            {
+                fileId = id,
+                name = plan.Files.FirstOrDefault(x => x.Id == id)?.Name
+            }).ToArray()).ToArray(),
+            preview = DatasetSplitter.Report(samples, plan.Labels, assigned, split, seed, plan.GroupOf),
+            recommendedPreview = DatasetSplitter.Report(samples, plan.Labels, recommended, recommendation, seed, plan.GroupOf)
         };
     }
 

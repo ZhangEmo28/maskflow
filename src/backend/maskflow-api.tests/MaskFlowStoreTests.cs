@@ -32,7 +32,7 @@ static class TestStore
     public static (MaskFlowStore Store, FakeRepository Repository) Create(MaskFlowState? initial = null)
     {
         var repository = new FakeRepository { Initial = initial };
-        var store = new MaskFlowStore(repository);
+        var store = new MaskFlowStore(repository, Path.Combine(Path.GetTempPath(), "maskflow-store-" + Guid.NewGuid().ToString("N")));
         store.Initialize();
         return (store, repository);
     }
