@@ -95,22 +95,27 @@
               <button class="btn secondary compact-btn" type="button" @click="startNewAnnotatePointTarget">新建目标</button>
               <button class="btn secondary compact-btn" type="button" :disabled="!annotate.pointDraft.points.length" @click="clearAnnotatePointDraft">清空点</button>
             </template>
-            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex <= 0" @click="selectAdjacentFile(-1)">上一张</button>
+            <button class="btn secondary compact-btn" type="button" :disabled="!annotate.canUndo" title="撤销 (Ctrl/⌘+Z)" @click="undoAnnotationEdit">撤销</button>
+            <button class="btn secondary compact-btn" type="button" :disabled="!annotate.canRedo" title="重做 (Ctrl/⌘+Shift+Z)" @click="redoAnnotationEdit">重做</button>
+            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex <= 0" title="上一张 (A)" @click="selectAdjacentFile(-1)">上一张</button>
             <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ files.rows.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
-            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex < 0 || currentFileIndex >= files.rows.length - 1" @click="selectAdjacentFile(1)">下一张</button>
+            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex < 0 || currentFileIndex >= files.rows.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
+            <button class="btn ghost compact-btn" type="button" title="快捷键 (?)" @click="annotate.showShortcutHelp = !annotate.showShortcutHelp">快捷键</button>
             <button class="btn danger compact-btn" type="button" :disabled="loading || !annotate.current" @click="deleteCurrentAnnotateFile">删除图片</button>
           </div>
           <div v-if="annotate.current" class="yolo-canvas">
             <div
               v-if="previewUrl(annotate.current)"
-              :class="['yolo-image-frame', { drawing: annotate.drawMode, pointing: annotate.pointMode }]"
+              :class="['yolo-image-frame', { drawing: annotate.drawMode, pointing: annotate.pointMode, panning: annotate.spaceHeld || annotate.panDrag, editing: annotate.editDrag }]"
               :style="yoloFrameStyle"
-              @pointerdown="annotate.pointMode ? handleAnnotatePointClick($event) : beginManualBox($event)"
-              @pointermove="updateManualBox"
-              @pointerup="finishManualBox"
-              @pointercancel="cancelManualBox"
-              @pointerleave="updateManualBox"
+              @pointerdown="onCanvasPointerDown"
+              @pointermove="onCanvasPointerMove"
+              @pointerup="onCanvasPointerUp"
+              @pointercancel="onCanvasPointerCancel"
+              @dblclick="onCanvasDoubleClick"
+              @wheel.prevent="onCanvasWheel"
               @contextmenu.prevent
+              @dragstart.prevent
             >
               <img :src="previewUrl(annotate.current)" alt="标注图片" @load="updateYoloFrame" />
               <img
@@ -147,10 +152,30 @@
                 :class="['yolo-box', { active: annotate.activeId === item.id, unassigned: !item.label, matched: reviewFilterActive && reviewFilterMatchedAnnotations.some((match) => match.id === item.id) }]"
                 :style="annotationBoxStyle(item)"
                 type="button"
-                @click="annotate.activeId = item.id"
+                @pointerdown="beginAnnotationEdit($event, item, 'move')"
               >
                 {{ formatAnnotationLabel(item.label) }}
               </button>
+              <template v-if="activeAnnotation && !annotate.drawMode && !annotate.pointMode">
+                <span
+                  v-for="handle in HANDLES"
+                  :key="handle"
+                  class="box-handle"
+                  :style="boxHandleStyle(activeAnnotation, handle)"
+                  @pointerdown="beginAnnotationEdit($event, activeAnnotation, 'resize', { handle })"
+                />
+              </template>
+              <!-- Polygon vertices matter only for segmentation exports; resize handles take priority where they overlap. -->
+              <template v-if="selectedProjectDataType === 'segmentation' && activeAnnotation?.segment?.length >= 6 && !annotate.drawMode && !annotate.pointMode">
+                <span
+                  v-for="(_, vertex) in activeAnnotation.segment.length / 2"
+                  :key="'v' + vertex"
+                  class="vertex-handle"
+                  :style="{ left: activeAnnotation.segment[vertex * 2] * 100 + '%', top: activeAnnotation.segment[vertex * 2 + 1] * 100 + '%' }"
+                  title="拖动调整顶点，Alt+点击删除，双击边插入顶点"
+                  @pointerdown="beginAnnotationEdit($event, activeAnnotation, 'vertex', { vertex })"
+                />
+              </template>
             </div>
             <div v-else class="empty-note">正在加载图片预览...</div>
             <div v-if="annotate.pointMode && annotate.pointDraft.candidates.length" class="point-candidate-bar">
@@ -158,7 +183,19 @@
               <span v-if="annotate.pointDraft.loading">更新中...</span>
             </div>
           </div>
-          <div v-else class="canvas-empty">
+          <div v-if="annotate.showShortcutHelp" class="shortcut-help" role="dialog" aria-label="快捷键说明">
+            <div class="shortcut-help-head">
+              <strong>快捷键</strong>
+              <button class="btn ghost compact-btn" type="button" @click="annotate.showShortcutHelp = false">关闭</button>
+            </div>
+            <dl>
+              <template v-for="[keys, description] in SHORTCUT_HELP" :key="keys">
+                <dt><kbd>{{ keys }}</kbd></dt>
+                <dd>{{ description }}</dd>
+              </template>
+            </dl>
+          </div>
+          <div v-if="!annotate.current" class="canvas-empty">
             <strong>选择图片开始标注</strong>
             <span>左侧上传或选择图片后，可运行 AI 自动生成候选标注。</span>
           </div>
@@ -166,7 +203,7 @@
             <button class="btn secondary compact-btn" type="button" @click="setYoloZoom(annotate.zoom - 0.1)">缩小</button>
             <button class="btn secondary compact-btn" type="button" @click="setYoloZoom(annotate.zoom + 0.1)">放大</button>
             <button class="btn ghost compact-btn" type="button" @click="resetYoloZoom">适配</button>
-            <input :value="Math.round(annotate.zoom * 100)" type="range" min="25" max="300" step="5" aria-label="缩放比例" @input="setYoloZoom($event.target.value / 100)" />
+            <input :value="Math.round(annotate.zoom * 100)" type="range" min="25" max="800" step="5" aria-label="缩放比例" @input="setYoloZoom($event.target.value / 100)" />
             <span>{{ Math.round(annotate.zoom * 100) }}%</span>
           </div>
         </section>
@@ -301,10 +338,13 @@
 
 <script setup>
 import { inject } from "vue";
+import { HANDLES, handleCursor } from "../../lib/boxEditing";
+import { SHORTCUT_HELP } from "../../lib/shortcuts";
 
 const annotate = inject("annotate");
 const projects = inject("projects");
 const selectedProject = inject("selectedProject");
+const selectedProjectDataType = inject("selectedProjectDataType");
 const selectedProjectDataTypeLabel = inject("selectedProjectDataTypeLabel");
 const selectedProjectExportHint = inject("selectedProjectExportHint");
 const files = inject("files");
@@ -325,6 +365,15 @@ const beginManualBox = inject("beginManualBox");
 const updateManualBox = inject("updateManualBox");
 const finishManualBox = inject("finishManualBox");
 const cancelManualBox = inject("cancelManualBox");
+const beginAnnotationEdit = inject("beginAnnotationEdit");
+const onCanvasPointerDown = inject("onCanvasPointerDown");
+const onCanvasPointerMove = inject("onCanvasPointerMove");
+const onCanvasPointerUp = inject("onCanvasPointerUp");
+const onCanvasPointerCancel = inject("onCanvasPointerCancel");
+const onCanvasDoubleClick = inject("onCanvasDoubleClick");
+const onCanvasWheel = inject("onCanvasWheel");
+const undoAnnotationEdit = inject("undoAnnotationEdit");
+const redoAnnotationEdit = inject("redoAnnotationEdit");
 const toggleManualDrawMode = inject("toggleManualDrawMode");
 const togglePointPromptMode = inject("togglePointPromptMode");
 const setAnnotatePointPolarity = inject("setAnnotatePointPolarity");
@@ -370,6 +419,14 @@ const annotationPolygonStyle = inject("annotationPolygonStyle");
 const labelChipStyle = inject("labelChipStyle");
 const labelSwatchStyle = inject("labelSwatchStyle");
 const annotationRowAccentStyle = inject("annotationRowAccentStyle");
+
+// Handles sit on the outer edge of the box stroke, which is drawn outside the true box.
+function boxHandleStyle(item, handle) {
+  const box = item.bbox;
+  const x = handle.includes("w") ? box.cx - box.width / 2 : handle.includes("e") ? box.cx + box.width / 2 : box.cx;
+  const y = handle.includes("n") ? box.cy - box.height / 2 : handle.includes("s") ? box.cy + box.height / 2 : box.cy;
+  return { left: `${x * 100}%`, top: `${y * 100}%`, cursor: handleCursor(handle) };
+}
 
 function onAnnotationLabelChange(item, value) {
   applyAnnotationLabel(item, value);

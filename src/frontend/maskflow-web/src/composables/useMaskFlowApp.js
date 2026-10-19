@@ -1,5 +1,20 @@
 import { computed, nextTick, onMounted, provide, reactive, ref, watch } from "vue";
 import { matchesAnnotationFilters } from "../lib/annotationReview";
+import { createAnnotationHistory } from "../lib/annotationHistory";
+import {
+  boxFromSegment,
+  insertVertex,
+  moveBox,
+  moveVertex,
+  nearestEdge,
+  nudgeBox,
+  removeVertex,
+  resizeBox,
+  scrollForAnchor,
+  transformSegment,
+  zoomAnchor
+} from "../lib/boxEditing";
+import { isTypingTarget, resolveShortcut } from "../lib/shortcuts";
 import { apiFetch, authHeaders, clearSession, downloadAuthenticated, formatBytes, saveSession, session, user as currentUser } from "../lib/api";
 import {
   buildAnnotationBoxStyle,
@@ -50,6 +65,8 @@ export function useMaskFlowApp() {
   const loading = ref(false);
   let annotationSelection = 0;
   let annotationEditRevision = 0;
+  const annotationHistory = createAnnotationHistory();
+  const MAX_ZOOM = 8;
   let analysisRequestId = 0;
 
   const auth = reactive({
@@ -124,6 +141,12 @@ export function useMaskFlowApp() {
     filter: "all",
     drawMode: false,
     drawingBox: null,
+    editDrag: null,
+    panDrag: null,
+    spaceHeld: false,
+    showShortcutHelp: false,
+    canUndo: false,
+    canRedo: false,
     pointMode: false,
     pointPolarity: 1,
     pointDraft: createEmptyPointDraft(),
@@ -1153,6 +1176,12 @@ export function useMaskFlowApp() {
     annotate.activeId = annotate.annotations[0]?.id || "";
     normalizeAnnotationLabels();
     if (options.status) {
+      annotationHistory.record(annotate.annotations);
+    } else {
+      annotationHistory.reset(annotate.annotations);
+    }
+    syncHistoryFlags();
+    if (options.status) {
       markAnnotationSaved(options.status);
     } else if (annotate.annotations.length) {
       markAnnotationSaved(`已加载 ${annotate.annotations.length} 条标注`);
@@ -1168,6 +1197,8 @@ export function useMaskFlowApp() {
     annotate.width = 0;
     annotate.height = 0;
     annotate.dirty = false;
+    annotate.editDrag = null;
+    resetAnnotationHistory();
   }
 
   async function persistBatchLabels() {
@@ -1508,16 +1539,59 @@ export function useMaskFlowApp() {
     }
   }
 
+  function syncHistoryFlags() {
+    annotate.canUndo = annotationHistory.canUndo;
+    annotate.canRedo = annotationHistory.canRedo;
+  }
+
+  function resetAnnotationHistory() {
+    annotationHistory.reset(annotate.annotations);
+    syncHistoryFlags();
+  }
+
   function markAnnotationDirty(status = "有未保存修改") {
     annotationEditRevision++;
     annotate.dirty = true;
     annotate.status = status;
+    annotationHistory.record(annotate.annotations);
+    syncHistoryFlags();
   }
 
   function markAnnotationSaved(status = "标注已保存") {
     annotate.dirty = false;
     annotate.savedAt = Date.now();
     annotate.status = status;
+  }
+
+  function restoreAnnotationSnapshot(snapshot, status) {
+    annotate.annotations = snapshot.map(normalizeAnnotationItem);
+    if (!annotate.annotations.some((item) => item.id === annotate.activeId)) {
+      annotate.activeId = annotate.annotations[0]?.id || "";
+    }
+    annotationEditRevision++;
+    annotate.dirty = true;
+    annotate.status = status;
+    syncHistoryFlags();
+  }
+
+  function undoAnnotationEdit() {
+    if (!annotate.ready) return;
+    const snapshot = annotationHistory.undo();
+    if (!snapshot) {
+      annotate.status = "没有可撤销的操作";
+      return;
+    }
+    restoreAnnotationSnapshot(snapshot, "已撤销，记得保存");
+  }
+
+  function redoAnnotationEdit() {
+    if (!annotate.ready) return;
+    const snapshot = annotationHistory.redo();
+    if (!snapshot) {
+      annotate.status = "没有可重做的操作";
+      return;
+    }
+    restoreAnnotationSnapshot(snapshot, "已重做，记得保存");
   }
 
   function canLeaveCurrentAnnotation() {
@@ -1885,8 +1959,330 @@ export function useMaskFlowApp() {
     }
   }
 
+  function annotationById(id) {
+    return annotate.annotations.find((item) => item.id === id) || null;
+  }
+
+  function frameElementFor(event) {
+    return event.currentTarget?.closest?.(".yolo-image-frame") || null;
+  }
+
+  // Box body → move, handle → resize, vertex → reshape polygon (Alt+click removes the vertex).
+  function beginAnnotationEdit(event, item, kind, detail = {}) {
+    if (!annotate.ready || annotate.drawMode || annotate.pointMode || annotate.spaceHeld) return;
+    if (event.button !== undefined && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    annotate.activeId = item.id;
+    if (kind === "vertex" && event.altKey) {
+      if (!item.segment || item.segment.length <= 6) {
+        annotate.status = "多边形至少需要 3 个顶点";
+        return;
+      }
+      item.segment = removeVertex(item.segment, detail.vertex);
+      item.bbox = boxFromSegment(item.segment) || item.bbox;
+      if (isExportableAnnotation(item)) item.confirmed = true;
+      markAnnotationDirty("已删除顶点，记得保存");
+      return;
+    }
+    const frame = frameElementFor(event);
+    const start = pointerToYoloPoint(event);
+    if (!frame || !start) return;
+    frame.setPointerCapture?.(event.pointerId);
+    annotate.editDrag = {
+      id: item.id,
+      kind,
+      handle: detail.handle || null,
+      vertex: detail.vertex ?? null,
+      start,
+      startClient: { x: event.clientX, y: event.clientY },
+      startBox: { ...item.bbox },
+      startSegment: item.segment ? [...item.segment] : null,
+      moved: false
+    };
+  }
+
+  function updateAnnotationEdit(event) {
+    const drag = annotate.editDrag;
+    if (!drag) return false;
+    const item = annotationById(drag.id);
+    const point = pointerToYoloPoint(event);
+    if (!item || !point) return true;
+    // Ignore jitter so a plain click only selects.
+    if (!drag.moved && Math.hypot(event.clientX - drag.startClient.x, event.clientY - drag.startClient.y) < 3) return true;
+    drag.moved = true;
+    if (drag.kind === "move") {
+      const box = moveBox(drag.startBox, point.x - drag.start.x, point.y - drag.start.y);
+      item.bbox = box;
+      if (drag.startSegment) item.segment = transformSegment(drag.startSegment, drag.startBox, box);
+    } else if (drag.kind === "resize") {
+      const box = resizeBox(drag.startBox, drag.handle, point);
+      item.bbox = box;
+      if (drag.startSegment) item.segment = transformSegment(drag.startSegment, drag.startBox, box);
+    } else if (drag.kind === "vertex" && drag.startSegment) {
+      item.segment = moveVertex(drag.startSegment, drag.vertex, point);
+      item.bbox = boxFromSegment(item.segment) || item.bbox;
+    }
+    return true;
+  }
+
+  function finishAnnotationEdit(event) {
+    const drag = annotate.editDrag;
+    if (!drag) return false;
+    annotate.editDrag = null;
+    event.currentTarget?.releasePointerCapture?.(event.pointerId);
+    const item = annotationById(drag.id);
+    if (drag.moved && item) {
+      if (isExportableAnnotation(item)) item.confirmed = true;
+      markAnnotationDirty(drag.kind === "vertex" ? "已调整多边形，记得保存" : "已调整目标框，记得保存");
+    }
+    return true;
+  }
+
+  function beginCanvasPan(event) {
+    const container = event.currentTarget?.closest?.(".yolo-canvas");
+    if (!container) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    annotate.panDrag = { x: event.clientX, y: event.clientY, left: container.scrollLeft, top: container.scrollTop, container };
+  }
+
+  function onCanvasPointerDown(event) {
+    if (annotate.spaceHeld || event.button === 1) {
+      beginCanvasPan(event);
+      return;
+    }
+    if (annotate.pointMode) {
+      handleAnnotatePointClick(event);
+      return;
+    }
+    if (annotate.drawMode) {
+      beginManualBox(event);
+      return;
+    }
+    if (event.button === 0 && event.target === event.currentTarget.querySelector("img")) annotate.activeId = "";
+  }
+
+  function onCanvasPointerMove(event) {
+    const pan = annotate.panDrag;
+    if (pan) {
+      pan.container.scrollLeft = pan.left - (event.clientX - pan.x);
+      pan.container.scrollTop = pan.top - (event.clientY - pan.y);
+      return;
+    }
+    if (updateAnnotationEdit(event)) return;
+    updateManualBox(event);
+  }
+
+  function onCanvasPointerUp(event) {
+    if (annotate.panDrag) {
+      annotate.panDrag = null;
+      event.currentTarget?.releasePointerCapture?.(event.pointerId);
+      return;
+    }
+    if (finishAnnotationEdit(event)) return;
+    finishManualBox(event);
+  }
+
+  function onCanvasPointerCancel(event) {
+    annotate.panDrag = null;
+    if (annotate.editDrag) {
+      const drag = annotate.editDrag;
+      const item = annotationById(drag.id);
+      if (item) {
+        item.bbox = drag.startBox;
+        item.segment = drag.startSegment;
+      }
+      annotate.editDrag = null;
+    }
+    cancelManualBox(event);
+  }
+
+  // Double-click near an edge of the selected polygon inserts a vertex there.
+  function onCanvasDoubleClick(event) {
+    if (annotate.drawMode || annotate.pointMode) return;
+    const item = activeAnnotation.value;
+    const frame = frameElementFor(event);
+    const point = pointerToYoloPoint(event);
+    if (!item?.segment || item.segment.length < 6 || !frame || !point) return;
+    const rect = frame.getBoundingClientRect();
+    const edge = nearestEdge(item.segment, point, rect.width / rect.height);
+    if (edge.index < 0 || edge.distance * rect.height > 12) return;
+    item.segment = insertVertex(item.segment, edge.index, point);
+    if (isExportableAnnotation(item)) item.confirmed = true;
+    markAnnotationDirty("已插入顶点，记得保存");
+  }
+
+  async function onCanvasWheel(event) {
+    const container = event.currentTarget?.closest?.(".yolo-canvas");
+    const frame = frameElementFor(event);
+    if (!container || !frame || !annotate.frame.width) return;
+    const containerRect = container.getBoundingClientRect();
+    const cursorX = event.clientX - containerRect.left;
+    const cursorY = event.clientY - containerRect.top;
+    const anchor = zoomAnchor({
+      cursorX,
+      cursorY,
+      scrollLeft: container.scrollLeft,
+      scrollTop: container.scrollTop,
+      frameLeft: frame.offsetLeft,
+      frameTop: frame.offsetTop,
+      frameWidth: frame.offsetWidth,
+      frameHeight: frame.offsetHeight
+    });
+    const factor = Math.exp(-Math.max(-100, Math.min(100, event.deltaY)) * 0.0025);
+    const next = Math.max(0.25, Math.min(MAX_ZOOM, annotate.zoom * factor));
+    if (Math.abs(next - annotate.zoom) < 0.001) return;
+    annotate.zoom = Math.round(next * 100) / 100;
+    await nextTick();
+    const scroll = scrollForAnchor({
+      anchor,
+      cursorX,
+      cursorY,
+      frameLeft: frame.offsetLeft,
+      frameTop: frame.offsetTop,
+      frameWidth: frame.offsetWidth,
+      frameHeight: frame.offsetHeight
+    });
+    container.scrollLeft = scroll.scrollLeft;
+    container.scrollTop = scroll.scrollTop;
+  }
+
+  function selectAdjacentAnnotation(direction) {
+    const items = annotate.annotations;
+    if (!items.length) return;
+    const index = items.findIndex((item) => item.id === annotate.activeId);
+    const next = index < 0 ? (direction > 0 ? 0 : items.length - 1) : (index + direction + items.length) % items.length;
+    annotate.activeId = items[next].id;
+  }
+
+  function nudgeActiveAnnotation(dx, dy) {
+    const item = activeAnnotation.value;
+    if (!item?.bbox || !annotate.width || !annotate.height) return false;
+    const box = nudgeBox(item.bbox, dx, dy, annotate.width, annotate.height);
+    if (item.segment) item.segment = transformSegment(item.segment, item.bbox, box);
+    item.bbox = box;
+    if (isExportableAnnotation(item)) item.confirmed = true;
+    markAnnotationDirty("已微调目标框，记得保存");
+    return true;
+  }
+
+  function escapeAnnotateMode() {
+    if (annotate.showShortcutHelp) {
+      annotate.showShortcutHelp = false;
+    } else if (annotate.drawingBox) {
+      cancelManualBox();
+    } else if (annotate.pointMode) {
+      if (annotate.pointDraft.points.length) clearAnnotatePointDraft();
+      else togglePointPromptMode();
+    } else if (annotate.drawMode) {
+      toggleManualDrawMode();
+    } else {
+      annotate.activeId = "";
+    }
+  }
+
+  // Returns false when the key should keep its default behaviour (e.g. arrows scroll without a selection).
+  function runAnnotateShortcut(shortcut) {
+    const editable = annotate.ready && !loading.value;
+    switch (shortcut.action) {
+      case "save":
+        if (editable && (annotate.dirty || annotationStats.value.pending)) saveAnnotation();
+        return true;
+      case "undo":
+        undoAnnotationEdit();
+        return true;
+      case "redo":
+        redoAnnotationEdit();
+        return true;
+      case "help":
+        annotate.showShortcutHelp = !annotate.showShortcutHelp;
+        return true;
+      case "escape":
+        escapeAnnotateMode();
+        return true;
+      case "previousImage":
+        selectAdjacentFile(-1);
+        return true;
+      case "nextImage":
+        selectAdjacentFile(1);
+        return true;
+      case "fit":
+        resetYoloZoom();
+        return true;
+      case "zoomIn":
+        setYoloZoom(annotate.zoom * 1.25);
+        return true;
+      case "zoomOut":
+        setYoloZoom(annotate.zoom / 1.25);
+        return true;
+      default:
+        break;
+    }
+    if (!editable) return false;
+    switch (shortcut.action) {
+      case "label": {
+        const label = annotate.labels[shortcut.index];
+        if (!label) {
+          annotate.status = `没有第 ${shortcut.index + 1} 个标签`;
+          return true;
+        }
+        applyLabelToActive(label);
+        return true;
+      }
+      case "delete":
+        if (!annotate.activeId) return false;
+        removeAnnotation(annotate.activeId);
+        return true;
+      case "toggleConfirm":
+        if (!annotate.activeId) return false;
+        toggleAnnotationConfirmed(annotate.activeId);
+        return true;
+      case "drawMode":
+        toggleManualDrawMode();
+        return true;
+      case "pointMode":
+        togglePointPromptMode();
+        return true;
+      case "enter":
+        if (!annotate.pointMode || !annotate.pointDraft.candidates.length) return false;
+        confirmAnnotatePointTarget();
+        return true;
+      case "nextAnnotation":
+        selectAdjacentAnnotation(1);
+        return true;
+      case "previousAnnotation":
+        selectAdjacentAnnotation(-1);
+        return true;
+      case "nudge":
+        return nudgeActiveAnnotation(shortcut.dx, shortcut.dy);
+      default:
+        return false;
+    }
+  }
+
+  function handleAnnotateKeydown(event) {
+    if (page.value !== "annotate") return;
+    if (event.code === "Space" && !isTypingTarget(event.target) && !event.ctrlKey && !event.metaKey) {
+      // Hold Space to pan; also stops a focused button from being "clicked" by the space bar.
+      annotate.spaceHeld = true;
+      event.preventDefault();
+      return;
+    }
+    const shortcut = resolveShortcut(event);
+    if (!shortcut) return;
+    if (runAnnotateShortcut(shortcut) !== false) event.preventDefault();
+  }
+
+  function handleAnnotateKeyup(event) {
+    if (event.code === "Space" && annotate.spaceHeld) {
+      annotate.spaceHeld = false;
+      event.preventDefault();
+    }
+  }
+
   function setYoloZoom(value) {
-    const next = Math.max(0.25, Math.min(3, Number(value) || 1));
+    const next = Math.max(0.25, Math.min(MAX_ZOOM, Number(value) || 1));
     annotate.zoom = Math.round(next * 100) / 100;
     // Keep the fitted base size; only re-fit when returning to 100% / 适配.
     if (Math.abs(annotate.zoom - 1) < 0.001) {
@@ -2157,6 +2553,9 @@ export function useMaskFlowApp() {
       refreshPage();
     });
     window.addEventListener("resize", updateYoloFrame);
+    window.addEventListener("keydown", handleAnnotateKeydown);
+    window.addEventListener("keyup", handleAnnotateKeyup);
+    window.addEventListener("blur", () => { annotate.spaceHeld = false; });
     if (needsLogin(page.value) && !session()) go("/auth.html");
     account.value = currentUser();
     refreshPage();
@@ -2171,6 +2570,8 @@ export function useMaskFlowApp() {
     saveStateText, yoloTxt, annotationBoxStyle, annotationPolygonStyle, labelChipStyle, labelSwatchStyle,
     annotationRowAccentStyle, labelColor, segmentPoints, yoloFrameStyle, updateYoloFrame,
     drawingBoxStyle, beginManualBox, updateManualBox, finishManualBox, cancelManualBox, toggleManualDrawMode,
+    beginAnnotationEdit, onCanvasPointerDown, onCanvasPointerMove, onCanvasPointerUp, onCanvasPointerCancel,
+    onCanvasDoubleClick, onCanvasWheel, undoAnnotationEdit, redoAnnotationEdit,
     togglePointPromptMode, setAnnotatePointPolarity, setSegmentPointPolarity, setSegmentPromptMode,
     handleAnnotatePointClick, handleSegmentPointClick, onSegmentImageLoad,
     selectAnnotatePointCandidate, selectSegmentPointCandidate,
