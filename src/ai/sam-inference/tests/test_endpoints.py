@@ -175,3 +175,68 @@ def test_yolo_predict_returns_normalized_detections(monkeypatch):
     assert len(first["yoloSegments"][0]) == 6
     assert second["yoloBox"]["width"] == pytest.approx(0.5)  # clamped to the image
     assert second["yoloSegments"] == []
+
+
+def make_video(path, frames=30, fps=10, size=(64, 48)):
+    import cv2
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    if not writer.isOpened():
+        pytest.skip("OpenCV build cannot encode mp4 here")
+    for index in range(frames):
+        frame = np.full((size[1], size[0], 3), 200, dtype=np.uint8)
+        frame[10:30, 5 + index: 25 + index] = (0, 0, 220)
+        writer.write(frame)
+    writer.release()
+
+
+def test_video_frames_are_sampled_at_the_requested_interval(tmp_path):
+    import zipfile as zf
+
+    video = tmp_path / "clip.mp4"
+    make_video(video)
+    response = client.post("/api/video/frames", headers=HEADERS, files={"video": ("clip.mp4", video.read_bytes(), "video/mp4")}, data={"every_seconds": "1", "max_frames": "10"})
+    assert response.status_code == 200, response.text
+    archive = zf.ZipFile(io.BytesIO(response.content))
+    manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["fps"] == pytest.approx(10, abs=0.5)
+    assert [frame["index"] for frame in manifest["frames"]] == [0, 10, 20]
+    assert all(Image.open(io.BytesIO(archive.read(frame["file"]))).size == (64, 48) for frame in manifest["frames"])
+
+
+def test_video_frames_reject_non_video():
+    response = client.post("/api/video/frames", headers=HEADERS, files={"video": ("clip.mp4", b"not a video", "video/mp4")})
+    assert response.status_code == 400
+
+
+def test_propagation_follows_each_box(monkeypatch):
+    calls = {}
+
+    class FakeAuto:
+        def predict(self, source, bboxes, **kwargs):
+            calls["bboxes"] = bboxes
+            # The object moved 10 px to the right on the new frame.
+            masks = np.stack([rect_mask(100, 100, 30, 20, 50, 40)])
+            return [FakeResult(FakeMasks(masks), FakeBoxes([0], [0.88]))]
+
+    monkeypatch.setattr(main, "_get_auto_model", lambda: FakeAuto())
+    boxes = [{"id": "car-1", "box": {"cx": 0.3, "cy": 0.3, "width": 0.2, "height": 0.2}}]
+    response = client.post("/api/video/propagate", headers=HEADERS, files={"image": ("f.png", png_bytes(), "image/png")}, data={"boxes": json.dumps(boxes), "margin": "0.15"})
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]
+    assert result["id"] == "car-1" and not result["lost"]
+    assert result["yoloBox"]["cx"] == pytest.approx(0.4, abs=0.02)
+    assert result["score"] == pytest.approx(0.88)
+    # Prompt box is the previous box enlarged by 15% on each side.
+    assert calls["bboxes"][0] == pytest.approx([17, 17, 43, 43])
+
+
+def test_propagation_reports_lost_objects(monkeypatch):
+    class Empty:
+        def predict(self, **kwargs):
+            return []
+
+    monkeypatch.setattr(main, "_get_auto_model", lambda: Empty())
+    boxes = [{"id": "a", "box": {"cx": 0.5, "cy": 0.5, "width": 0.1, "height": 0.1}}]
+    response = client.post("/api/video/propagate", headers=HEADERS, files={"image": ("f.png", png_bytes(), "image/png")}, data={"boxes": json.dumps(boxes)})
+    assert response.json()["results"] == [{"id": "a", "lost": True}]

@@ -10,6 +10,8 @@ public static class DependencyInjection
         services.AddSingleton<AutoAnnotationService>();
         services.AddSingleton<BatchAnnotationWorker>();
         services.AddHostedService(provider => provider.GetRequiredService<BatchAnnotationWorker>());
+        services.AddSingleton<VideoTaskWorker>();
+        services.AddHostedService(provider => provider.GetRequiredService<VideoTaskWorker>());
         return services;
     }
 }

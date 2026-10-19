@@ -123,11 +123,15 @@ public class TeamAccessTests : IClassFixture<MaskFlowApp>
             await stranger.Post("/api/export/analyze", exportBody),
             await stranger.Post("/api/export/dataset", exportBody),
             await stranger.Post("/api/annotations/batch", new { projectId }),
+            await stranger.Post($"/api/annotations/file/{fileId}/propagate", new { count = 3 }),
+            await stranger.Get($"/api/projects/{projectId}/videos"),
             await stranger.Delete($"/api/projects/{projectId}")
         })
         {
             Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         }
+
+        Assert.Equal(HttpStatusCode.BadRequest, (await owner.Post($"/api/annotations/file/{fileId}/propagate", new { count = 3 })).StatusCode);
 
         var projects = await stranger.Json(await stranger.Get("/api/projects"));
         Assert.Equal(0, projects.GetProperty("projects").GetArrayLength());

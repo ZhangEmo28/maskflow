@@ -46,6 +46,10 @@ public sealed class FilesController : MaskFlowControllerBase
         }
 
         var assignments = Store.State.FileAssignments.ToDictionary(x => x.FileId, x => x.UserId);
+        var frames = Store.State.Videos
+            .SelectMany(video => video.FrameFileIds.Select((id, index) => (id, video.Id, Index: video.FrameIndexes.ElementAtOrDefault(index))))
+            .GroupBy(x => x.id)
+            .ToDictionary(x => x.Key, x => x.First());
         var files = source
             .OrderByDescending(x => x.CreatedAt)
             .Select(file =>
@@ -72,7 +76,9 @@ public sealed class FilesController : MaskFlowControllerBase
                     ReviewStatus = set?.ReviewStatus,
                     ReviewComment = set?.ReviewComment,
                     AssignedTo = assignedTo,
-                    AssignedToEmail = assignedTo is null ? null : Store.GetUser(assignedTo.Value)?.Email
+                    AssignedToEmail = assignedTo is null ? null : Store.GetUser(assignedTo.Value)?.Email,
+                    VideoId = frames.TryGetValue(file.Id, out var frame) ? frame.Id : null,
+                    FrameIndex = frames.TryGetValue(file.Id, out var frameAt) ? frameAt.Index : (int?)null
                 };
             });
         return Ok(new { files, user = Store.PublicUser(Store.GetUser(user.Id)!) });

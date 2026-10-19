@@ -67,6 +67,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadProjectMembersAsync(connection, state);
         await LoadProjectInvitesAsync(connection, state);
         await LoadFileAssignmentsAsync(connection, state);
+        await LoadVideosAsync(connection, state);
         await LoadFilesAsync(connection, state);
         await LoadAnnotationSetsAsync(connection, state);
         await LoadTasksAsync(connection, state);
@@ -151,6 +152,11 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 ["id", "project_id", "email", "role", "token_hash", "invited_by", "created_at", "expires_at"],
                 before.ProjectInvites, current.ProjectInvites, x => x.Id,
                 x => [x.Id, x.ProjectId, x.Email, x.Role, x.TokenHash, x.InvitedBy, x.CreatedAt, x.ExpiresAt]);
+
+            await ApplyAsync(connection, tx, "videos", "id",
+                ["id", "user_id", "project_id", "name", "object_path", "size_bytes", "fps", "duration_sec", "every_seconds", "frame_file_ids_json", "frame_indexes_json", "status", "error", "created_at"],
+                before.Videos, current.Videos, x => x.Id,
+                x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Fps, x.DurationSec, x.EverySeconds, Json(x.FrameFileIds), Json(x.FrameIndexes), x.Status, x.Error, x.CreatedAt]);
 
             await ApplyAsync(connection, tx, "file_assignments", "file_id",
                 ["file_id", "user_id", "assigned_by", "assigned_at"],
@@ -315,6 +321,11 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
 
     async Task LoadProjectInvitesAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM project_invites", r =>
         s.ProjectInvites.Add(new ProjectInvite(S(r, "id"), S(r, "project_id"), S(r, "email"), S(r, "role"), S(r, "token_hash"), I(r, "invited_by"), D(r, "created_at"), D(r, "expires_at"))));
+
+    async Task LoadVideosAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM videos", r =>
+        s.Videos.Add(new VideoItem(S(r, "id"), I(r, "user_id"), S(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"),
+            Db(r, "fps"), Db(r, "duration_sec"), Db(r, "every_seconds"), FromJson<List<int>>(S(r, "frame_file_ids_json")) ?? [],
+            FromJson<List<int>>(S(r, "frame_indexes_json")) ?? [], S(r, "status"), N(r, "error"), D(r, "created_at"))));
 
     async Task LoadFileAssignmentsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM file_assignments", r =>
         s.FileAssignments.Add(new FileAssignment(I(r, "file_id"), I(r, "user_id"), I(r, "assigned_by"), D(r, "assigned_at"))));
@@ -808,6 +819,25 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           assigned_by INT NOT NULL,
           assigned_at DATETIME(6) NOT NULL,
           INDEX ix_file_assignments_user (user_id)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS videos (
+          id VARCHAR(64) PRIMARY KEY,
+          user_id INT NOT NULL,
+          project_id VARCHAR(64) NOT NULL,
+          name VARCHAR(255) NOT NULL,
+          object_path VARCHAR(1200) NOT NULL,
+          size_bytes BIGINT NOT NULL,
+          fps DOUBLE NOT NULL,
+          duration_sec DOUBLE NOT NULL,
+          every_seconds DOUBLE NOT NULL,
+          frame_file_ids_json JSON NOT NULL,
+          frame_indexes_json JSON NOT NULL,
+          status VARCHAR(20) NOT NULL,
+          error TEXT NULL,
+          created_at DATETIME(6) NOT NULL,
+          INDEX ix_videos_project (project_id)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """,
         // Column additions go last so their tables exist on a fresh database.
