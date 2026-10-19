@@ -4,7 +4,7 @@
 
 <p align="center"><strong>An end-to-end AI annotation workbench for turning raw images into training-ready datasets.</strong><br />Built with SAM 3, YOLO, Vue 3, ASP.NET Core, and FastAPI.</p>
 
-<p align="center"><a href="https://github.com/Z18393520308/maskflow/actions/workflows/ci.yml"><img src="https://github.com/Z18393520308/maskflow/actions/workflows/ci.yml/badge.svg" alt="CI" /></a> <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License" /></a> <a href="https://github.com/Z18393520308/maskflow/releases"><img src="https://img.shields.io/github/v/release/Z18393520308/maskflow" alt="Release" /></a></p>
+<p align="center"><a href="https://github.com/ZhangEmo28/maskflow/actions/workflows/ci.yml"><img src="https://github.com/ZhangEmo28/maskflow/actions/workflows/ci.yml/badge.svg" alt="CI" /></a> <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License" /></a> <a href="https://github.com/ZhangEmo28/maskflow/releases"><img src="https://img.shields.io/github/v/release/ZhangEmo28/maskflow" alt="Release" /></a></p>
 
 <p align="center"><a href="./docs/screenshots/yolo-annotation-workbench.png"><img src="./docs/screenshots/yolo-annotation-workbench.png" alt="MaskFlow YOLO annotation workbench" width="100%" /></a></p>
 
@@ -39,7 +39,7 @@
 ### Clone and configure
 
 ```bash
-git clone https://github.com/Z18393520308/maskflow.git
+git clone https://github.com/ZhangEmo28/maskflow.git
 cd maskflow
 cp .env.example .env
 mkdir -p 资源/模型

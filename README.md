@@ -8,9 +8,9 @@
 
 基于 SAM 3、YOLO、Vue 3、ASP.NET Core 与 FastAPI，支持图片管理、智能分割、人工复核和数据集导出。
 
-[![CI](https://github.com/Z18393520308/maskflow/actions/workflows/ci.yml/badge.svg)](https://github.com/Z18393520308/maskflow/actions/workflows/ci.yml)
+[![CI](https://github.com/ZhangEmo28/maskflow/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhangEmo28/maskflow/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
-[![Release](https://img.shields.io/github/v/release/Z18393520308/maskflow)](https://github.com/Z18393520308/maskflow/releases)
+[![Release](https://img.shields.io/github/v/release/ZhangEmo28/maskflow)](https://github.com/ZhangEmo28/maskflow/releases)
 [![Vue 3](https://img.shields.io/badge/Vue-3-42b883.svg)](https://vuejs.org/)
 [![.NET 9](https://img.shields.io/badge/.NET-9-512bd4.svg)](https://dotnet.microsoft.com/)
 
@@ -69,7 +69,7 @@
 macOS、Linux 或 WSL：
 
 ```bash
-git clone https://github.com/Z18393520308/maskflow.git
+git clone https://github.com/ZhangEmo28/maskflow.git
 cd maskflow
 
 cp .env.example .env
@@ -80,7 +80,7 @@ mkdir -p 资源/模型
 Windows PowerShell：
 
 ```powershell
-git clone https://github.com/Z18393520308/maskflow.git
+git clone https://github.com/ZhangEmo28/maskflow.git
 Set-Location maskflow
 
 Copy-Item .env.example .env
@@ -181,7 +181,7 @@ cp .env.production.example .env
 4. 保持 SAM、MySQL、MinIO 和 API 监听在 `127.0.0.1` 或受控私有网络。
 5. 执行 `docker compose config` 检查最终配置，再启动服务。
 
-Production 模式会拒绝示例/开发密钥，并禁止 `MASKFLOW_BILLING_DEV_MODE` 和 `MASKFLOW_PASSWORD_RESET_INLINE`。
+Production 模式会拒绝示例/开发密钥，并禁止 `MASKFLOW_BILLING_DEV_MODE`。重置密码的重置码不会通过接口返回：开发环境打印在 API 日志里，生产环境需配置邮件服务。
 
 ## 常用命令
 
@@ -254,7 +254,7 @@ docker compose config --quiet
 
 ## 参与贡献
 
-欢迎通过 [Issues](https://github.com/Z18393520308/maskflow/issues) 报告问题、提出功能建议，或提交 Pull Request。提交前请确保 CI 全部通过，并避免提交模型权重、数据集、密钥和本地运行文件。
+欢迎通过 [Issues](https://github.com/ZhangEmo28/maskflow/issues) 报告问题、提出功能建议，或提交 Pull Request。提交前请确保 CI 全部通过，并避免提交模型权重、数据集、密钥和本地运行文件。
 
 ## 许可证
 

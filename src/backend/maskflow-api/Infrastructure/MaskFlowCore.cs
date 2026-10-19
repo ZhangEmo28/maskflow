@@ -3,12 +3,10 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.IO.Compression;
+using System.Runtime.ExceptionServices;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Jpeg;
-using SixLabors.ImageSharp.Processing;
 
 public static class Util
 {
@@ -29,6 +27,9 @@ public sealed class MaskFlowStore
     bool UseMinio => !string.IsNullOrWhiteSpace(MinioEndpoint);
     public MaskFlowState State { get; private set; } = new();
     readonly HashSet<string> pendingProjectLabelSync = new(StringComparer.Ordinal);
+    readonly List<string> deleteAfterCommit = [];
+    readonly List<string> deleteOnRollback = [];
+    readonly Lazy<AmazonS3Client> s3Client;
     readonly ConcurrentDictionary<string, PasswordResetEntry> passwordResetTokens = new(StringComparer.OrdinalIgnoreCase);
 
     sealed record PasswordResetEntry(string TokenHash, DateTimeOffset ExpiresAt);
@@ -36,6 +37,7 @@ public sealed class MaskFlowStore
     public MaskFlowStore(IMaskFlowRepository repository)
     {
         this.repository = repository;
+        s3Client = new Lazy<AmazonS3Client>(CreateS3Client, LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     public void Initialize()
@@ -45,41 +47,25 @@ public sealed class MaskFlowStore
         State = repository.LoadAsync().GetAwaiter().GetResult() ?? new MaskFlowState();
         EnsureMinioBucketAsync().GetAwaiter().GetResult();
         Seed();
+        SyncTaskJobStatuses();
         SaveAsync().GetAwaiter().GetResult();
     }
 
     public Task SaveAsync() => SaveAsync(mutate: null);
 
-    public async Task SaveAsync(Action? mutate)
-    {
-        await gate.WaitAsync();
-        var original = State;
-        var working = CloneState(original);
-        var originalPendingLabels = pendingProjectLabelSync.ToHashSet(StringComparer.Ordinal);
-        try
+    public Task SaveAsync(Action? mutate) =>
+        SaveCoreAsync(mutate is null ? null : () =>
         {
-            State = working;
-            mutate?.Invoke();
-            await repository.SaveAsync(State, TakePendingProjectLabelSync());
-        }
-        catch
-        {
-            State = original;
-            pendingProjectLabelSync.Clear();
-            foreach (var projectId in originalPendingLabels)
-            {
-                pendingProjectLabelSync.Add(projectId);
-            }
-            throw;
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
+            mutate();
+            return Task.CompletedTask;
+        });
 
-    public async Task SaveAsync(Func<Task>? mutateAsync)
+    public Task SaveAsync(Func<Task>? mutateAsync) => SaveCoreAsync(mutateAsync);
+
+    async Task SaveCoreAsync(Func<Task>? mutateAsync)
     {
+        List<string> storageCleanup;
+        Exception? failure = null;
         await gate.WaitAsync();
         var original = State;
         var working = CloneState(original);
@@ -93,20 +79,44 @@ public sealed class MaskFlowStore
             }
 
             await repository.SaveAsync(State, TakePendingProjectLabelSync());
+            storageCleanup = [.. deleteAfterCommit];
         }
-        catch
+        catch (Exception ex)
         {
             State = original;
             pendingProjectLabelSync.Clear();
-            foreach (var projectId in originalPendingLabels)
-            {
-                pendingProjectLabelSync.Add(projectId);
-            }
-            throw;
+            pendingProjectLabelSync.UnionWith(originalPendingLabels);
+            storageCleanup = [.. deleteOnRollback];
+            failure = ex;
         }
         finally
         {
+            deleteAfterCommit.Clear();
+            deleteOnRollback.Clear();
             gate.Release();
+        }
+
+        // Object storage is not transactional: delete only after the database agrees,
+        // and remove freshly written objects when the database write was rolled back.
+        await DeleteStoredObjectsQuietlyAsync(storageCleanup);
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    async Task DeleteStoredObjectsQuietlyAsync(IEnumerable<string> paths)
+    {
+        foreach (var path in paths)
+        {
+            try
+            {
+                await DeleteStoredObjectAsync(path);
+            }
+            catch
+            {
+                // Best effort: an orphaned object only costs storage, never correctness.
+            }
         }
     }
 
@@ -159,7 +169,7 @@ public sealed class MaskFlowStore
     async Task EnsureMinioBucketAsync()
     {
         if (!UseMinio) return;
-        using var client = CreateS3Client();
+        var client = s3Client.Value;
         var buckets = await client.ListBucketsAsync();
         if (buckets.Buckets.Any(x => x.BucketName == MinioBucket)) return;
         await client.PutBucketAsync(new PutBucketRequest { BucketName = MinioBucket });
@@ -168,6 +178,14 @@ public sealed class MaskFlowStore
     public async Task<AuthResult?> RegisterAsync(string email, string password, string? username, HttpContext context)
     {
         email = email.Trim().ToLowerInvariant();
+        if (State.Users.Any(x => x.Email == email))
+        {
+            return null;
+        }
+
+        // PBKDF2 is deliberately slow; never run it while holding the global write lock.
+        var salt = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        var passwordHash = HashPassword(password, salt);
         AuthResult? result = null;
         await SaveAsync(() =>
         {
@@ -176,8 +194,7 @@ public sealed class MaskFlowStore
                 return;
             }
 
-            var salt = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-            var user = new User(State.NextUserId++, email, HashPassword(password, salt), salt, "free", 10L * 1024 * 1024 * 1024, 0, DateTimeOffset.UtcNow, username, "", null);
+            var user = new User(State.NextUserId++, email, passwordHash, salt, "free", 10L * 1024 * 1024 * 1024, 0, DateTimeOffset.UtcNow, username, "", null);
             State.Users.Add(user);
             State.Quotas[user.Id.ToString()] = new AiQuota("free", ResolveDailyLimit("free"), 0, DateOnly.FromDateTime(DateTime.UtcNow));
             State.TeamMembers.Add(new TeamMember("mem_owner_" + user.Id, user.Id, email, "owner", "active", DateTimeOffset.UtcNow));
@@ -193,11 +210,24 @@ public sealed class MaskFlowStore
     public async Task<AuthResult?> LoginAsync(string email, string password, HttpContext context)
     {
         var normalizedEmail = email.Trim().ToLowerInvariant();
+        var candidate = State.Users.FirstOrDefault(x => x.Email == normalizedEmail);
+        if (candidate is null)
+        {
+            // Spend the same PBKDF2 time as a real check so response timing does not reveal registered emails.
+            VerifyPassword(password, DummyPasswordHash, DummyPasswordSalt);
+            return null;
+        }
+
+        if (!VerifyPassword(password, candidate.PasswordHash, candidate.Salt))
+        {
+            return null;
+        }
+
         AuthResult? result = null;
         await SaveAsync(() =>
         {
-            var current = State.Users.FirstOrDefault(x => x.Email == normalizedEmail);
-            if (current is null || !VerifyPassword(password, current.PasswordHash, current.Salt))
+            var current = GetUser(candidate.Id);
+            if (current is null || current.PasswordHash != candidate.PasswordHash)
             {
                 return;
             }
@@ -268,12 +298,19 @@ public sealed class MaskFlowStore
             return false;
         }
 
+        var salt = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        var passwordHash = HashPassword(newPassword, salt);
         var changed = false;
         await SaveAsync(() =>
         {
-            var salt = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-            State.Users.Remove(user);
-            State.Users.Add(user with { Salt = salt, PasswordHash = HashPassword(newPassword, salt) });
+            // Re-read inside the write lock: the user record may have changed (e.g. storage usage) meanwhile.
+            var current = GetUser(userId);
+            if (current is null)
+            {
+                return;
+            }
+
+            ReplaceUser(current with { Salt = salt, PasswordHash = passwordHash });
             InvalidateSessions(userId, keepSessionToken);
             changed = true;
         });
@@ -341,21 +378,6 @@ public sealed class MaskFlowStore
         return changed;
     }
 
-    static bool ShouldExposePasswordResetToken()
-    {
-        var env = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "";
-        if (env.Equals("Development", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        var flag = Environment.GetEnvironmentVariable("MASKFLOW_PASSWORD_RESET_INLINE");
-        return string.Equals(flag, "true", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(flag, "1", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public bool PasswordResetReturnsToken => ShouldExposePasswordResetToken();
-
     static int ResolveDailyLimit(string plan)
     {
         var overrideLimit = Environment.GetEnvironmentVariable("MASKFLOW_AI_DAILY_LIMIT");
@@ -389,48 +411,23 @@ public sealed class MaskFlowStore
             State.Quotas[userId.ToString()] = new AiQuota(plan, limit, 0, DateOnly.FromDateTime(DateTime.UtcNow));
         });
 
-    public AiQuota GetQuota(User user) => RefreshQuota(user).quota;
-
-    public async Task<AiQuota> GetQuotaAsync(User user)
+    // Reads never mutate shared state: a stale stored quota (new day / plan change) is
+    // recomputed here and only written back when quota is actually consumed.
+    public AiQuota GetQuota(User user)
     {
-        await gate.WaitAsync();
-        try
-        {
-            var (quota, changed) = RefreshQuota(user);
-            if (changed)
-            {
-                await repository.SaveAsync(State);
-            }
-
-            return quota;
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-    (AiQuota quota, bool changed) RefreshQuota(User user)
-    {
-        var key = user.Id.ToString();
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var limit = ResolveDailyLimit(user.Plan);
-        if (!State.Quotas.TryGetValue(key, out var quota) || quota.DailyResetAt < today)
+        if (!State.Quotas.TryGetValue(user.Id.ToString(), out var quota) || quota.DailyResetAt < today)
         {
-            quota = new AiQuota(user.Plan, limit, 0, today);
-            State.Quotas[key] = quota;
-            return (quota, true);
+            return new AiQuota(user.Plan, limit, 0, today);
         }
 
-        if (quota.DailyLimit != limit || quota.Plan != user.Plan)
-        {
-            quota = quota with { Plan = user.Plan, DailyLimit = limit };
-            State.Quotas[key] = quota;
-            return (quota, true);
-        }
-
-        return (quota, false);
+        return quota.DailyLimit != limit || quota.Plan != user.Plan
+            ? quota with { Plan = user.Plan, DailyLimit = limit }
+            : quota;
     }
+
+    public Task<AiQuota> GetQuotaAsync(User user) => Task.FromResult(GetQuota(user));
 
     public Task ConsumeAiQuotaAsync(int userId, int amount) =>
         SaveAsync(() => ApplyQuotaConsumption(userId, amount));
@@ -464,6 +461,7 @@ public sealed class MaskFlowStore
 
             var safeName = Path.GetFileName(upload.FileName);
             var path = await PersistUploadAsync(upload, user.Id, projectId, safeName);
+            deleteOnRollback.Add(path);
             var fileId = State.NextFileId++;
             item = new FileItem(fileId, currentUser.Id, projectId, safeName, path, upload.Length, "image", upload.ContentType, DateTimeOffset.UtcNow, $"/api/files/{fileId}/download");
             State.Files.Add(item);
@@ -480,7 +478,7 @@ public sealed class MaskFlowStore
         var objectKey = $"{prefix}/{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Util.Id()}_{safeName}";
         if (UseMinio)
         {
-            using var client = CreateS3Client();
+            var client = s3Client.Value;
             await using var stream = upload.OpenReadStream();
             await client.PutObjectAsync(new PutObjectRequest
             {
@@ -507,11 +505,17 @@ public sealed class MaskFlowStore
         var safeName = Path.GetFileName(fileName);
         var prefix = $"users/{userId}/projects/{projectId}/uploads";
         var objectKey = $"{prefix}/{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Util.Id()}_{safeName}";
+        if (UseMinio && sourcePath.StartsWith("minio://", StringComparison.OrdinalIgnoreCase))
+        {
+            var (sourceBucket, sourceKey) = ParseMinioPath(sourcePath);
+            await s3Client.Value.CopyObjectAsync(sourceBucket, sourceKey, MinioBucket, objectKey);
+            return $"minio://{MinioBucket}/{objectKey}";
+        }
+
         if (UseMinio)
         {
-            using var client = CreateS3Client();
             await using var sourceStream = await OpenStoredObjectAsync(sourcePath);
-            await client.PutObjectAsync(new PutObjectRequest
+            await s3Client.Value.PutObjectAsync(new PutObjectRequest
             {
                 BucketName = MinioBucket,
                 Key = objectKey,
@@ -601,6 +605,7 @@ public sealed class MaskFlowStore
             foreach (var sourceFile in sourceFiles)
             {
                 var copiedPath = await CopyStoredObjectAsync(sourceFile.Path, userId, copied.Id, sourceFile.Name, sourceFile.ContentType);
+                deleteOnRollback.Add(copiedPath);
                 var fileId = State.NextFileId++;
                 var copiedFile = new FileItem(
                     fileId,
@@ -645,7 +650,7 @@ public sealed class MaskFlowStore
     public async Task<bool> DeleteProjectAsync(int userId, string projectId)
     {
         var deleted = false;
-        await SaveAsync(async () =>
+        await SaveAsync(() =>
         {
             var project = State.Projects.FirstOrDefault(x => x.Id == projectId && x.UserId == userId);
             if (project is null)
@@ -656,10 +661,15 @@ public sealed class MaskFlowStore
             var fileIds = State.Files.Where(x => x.UserId == userId && x.ProjectId == projectId).Select(x => x.Id).ToList();
             foreach (var fileId in fileIds)
             {
-                await DeleteFileCoreLockedAsync(userId, fileId);
+                DeleteFileCoreLocked(userId, fileId);
             }
 
             State.Tasks.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
+            foreach (var export in State.Exports.Where(x => x.UserId == userId && x.ProjectId == projectId && x.Path is not null))
+            {
+                deleteAfterCommit.Add(export.Path!);
+            }
+
             State.Exports.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
             MarkProjectLabelsDirty(projectId);
             State.ProjectLabels.Remove(projectId);
@@ -672,17 +682,17 @@ public sealed class MaskFlowStore
     public async Task<bool> DeleteFileAsync(int userId, int fileId)
     {
         var deleted = false;
-        await SaveAsync(async () => deleted = await DeleteFileCoreLockedAsync(userId, fileId));
+        await SaveAsync(() => { deleted = DeleteFileCoreLocked(userId, fileId); });
         return deleted;
     }
 
-    async Task<bool> DeleteFileCoreLockedAsync(int userId, int fileId)
+    bool DeleteFileCoreLocked(int userId, int fileId)
     {
         var file = State.Files.FirstOrDefault(x => x.Id == fileId && x.UserId == userId);
         if (file is null) return false;
         State.Files.Remove(file);
         State.AnnotationSets.RemoveAll(x => x.FileId == fileId && x.UserId == userId);
-        await DeleteStoredObjectAsync(file.Path);
+        deleteAfterCommit.Add(file.Path);
 
         var user = GetUser(userId);
         if (user is not null)
@@ -735,17 +745,16 @@ public sealed class MaskFlowStore
         TaskItem? completed = null;
         await SaveAsync(() =>
         {
-            set = ApplyAnnotationSet(userId, request);
+            var existing = GetAnnotationSet(userId, file.Id);
+            var merged = AnnotationMerge.KeepConfirmed(existing?.Annotations, request.Annotations);
+            set = ApplyAnnotationSet(userId, request with { Annotations = merged });
             var task = CreateTaskCore(userId, "yolo_auto_annotation", $"自动标注 {file.Name}", file.ProjectId, file.Id, 1);
-            State.Tasks.Remove(task);
-            completed = task with
+            completed = ApplyTaskUpdate(userId, task.Id, "completed", 1, null, new Dictionary<string, object?>
             {
-                Status = "completed",
-                Progress = 1,
-                Result = new Dictionary<string, object?> { ["fileId"] = file.Id, ["annotationCount"] = set.Annotations.Count },
-                FinishedAt = DateTimeOffset.UtcNow
-            };
-            State.Tasks.Add(completed);
+                ["fileId"] = file.Id,
+                ["annotationCount"] = set.Annotations.Count,
+                ["keptConfirmed"] = merged.Count(x => x.Confirmed)
+            });
             ApplyQuotaConsumption(userId, quotaAmount);
         });
         return (set!, completed!);
@@ -1093,6 +1102,7 @@ public sealed class MaskFlowStore
             var exportDir = Path.Combine(StorageRoot, userId.ToString(), "exports");
             Directory.CreateDirectory(exportDir);
             var zipPath = Path.Combine(exportDir, $"{exportId}.zip");
+            deleteOnRollback.Add(zipPath);
             var annotationMap = plan.Annotations;
             var labeledFiles = plan.Files;
             var exportFormat = plan.Format;
@@ -1170,10 +1180,9 @@ public sealed class MaskFlowStore
             if (UseMinio)
             {
                 var exportKey = $"users/{userId}/exports/{exportId}.zip";
-                using (var client = CreateS3Client())
                 await using (var zipStream = File.OpenRead(zipPath))
                 {
-                    await client.PutObjectAsync(new PutObjectRequest
+                    await s3Client.Value.PutObjectAsync(new PutObjectRequest
                     {
                         BucketName = MinioBucket,
                         Key = exportKey,
@@ -1182,6 +1191,7 @@ public sealed class MaskFlowStore
                     });
                 }
                 exportPath = $"minio://{MinioBucket}/{exportKey}";
+                deleteOnRollback.Add(exportPath);
                 File.Delete(zipPath);
             }
 
@@ -1221,19 +1231,19 @@ public sealed class MaskFlowStore
         {
             var file = fileSamples[0].File;
             await using var imageStream = await OpenStoredObjectAsync(file.Path);
-            using var image = await Image.LoadAsync(imageStream);
+            using var image = await ImageTools.DecodeOrientedAsync(imageStream);
             foreach (var sample in fileSamples)
             {
-                var cropRect = BuildCropRectangle(sample.Annotation.Bbox, image.Width, image.Height);
+                var cropRect = ImageTools.CropRectangle(sample.Annotation.Bbox, image.Width, image.Height);
                 if (cropRect.Width <= 0 || cropRect.Height <= 0) continue;
 
                 var targetSplit = assignments[fileId];
                 var labelDir = SanitizeFileName(sample.Annotation.Label ?? "unassigned");
                 var stem = SanitizeFileName($"{fileId}_{Path.GetFileNameWithoutExtension(file.Name)}_{sample.Annotation.Id}");
                 var cropEntry = archive.CreateEntry($"classification/{targetSplit}/{labelDir}/{stem}.jpg");
-                using var crop = image.Clone(ctx => ctx.Crop(cropRect));
+                var jpeg = ImageTools.EncodeJpegCrop(image, cropRect);
                 await using var cropStream = cropEntry.Open();
-                await crop.SaveAsJpegAsync(cropStream, new JpegEncoder { Quality = 92 });
+                await cropStream.WriteAsync(jpeg);
                 exported += 1;
             }
         }
@@ -1244,30 +1254,14 @@ public sealed class MaskFlowStore
         }
     }
 
-    static Rectangle BuildCropRectangle(YoloBox box, int imageWidth, int imageHeight)
-    {
-        var left = Clamp01(box.Cx - box.Width / 2) * imageWidth;
-        var top = Clamp01(box.Cy - box.Height / 2) * imageHeight;
-        var right = Clamp01(box.Cx + box.Width / 2) * imageWidth;
-        var bottom = Clamp01(box.Cy + box.Height / 2) * imageHeight;
-        var x = Math.Clamp((int)Math.Floor(left), 0, Math.Max(0, imageWidth - 1));
-        var y = Math.Clamp((int)Math.Floor(top), 0, Math.Max(0, imageHeight - 1));
-        var width = Math.Clamp((int)Math.Ceiling(right) - x, 1, imageWidth - x);
-        var height = Math.Clamp((int)Math.Ceiling(bottom) - y, 1, imageHeight - y);
-        return new Rectangle(x, y, width, height);
-    }
-
     public async Task<Stream> OpenStoredObjectAsync(string path)
     {
         if (path.StartsWith("minio://", StringComparison.OrdinalIgnoreCase))
         {
             var (bucket, key) = ParseMinioPath(path);
-            using var client = CreateS3Client();
-            using var response = await client.GetObjectAsync(bucket, key);
-            var memory = new MemoryStream();
-            await response.ResponseStream.CopyToAsync(memory);
-            memory.Position = 0;
-            return memory;
+            var response = await s3Client.Value.GetObjectAsync(bucket, key);
+            // Stream straight from MinIO instead of buffering whole objects (exports can be GBs).
+            return new S3ObjectStream(response);
         }
 
         return File.OpenRead(path);
@@ -1280,7 +1274,7 @@ public sealed class MaskFlowStore
             try
             {
                 var (bucket, key) = ParseMinioPath(path);
-                using var client = CreateS3Client();
+                var client = s3Client.Value;
                 await client.GetObjectMetadataAsync(bucket, key);
                 return true;
             }
@@ -1298,7 +1292,7 @@ public sealed class MaskFlowStore
         if (path.StartsWith("minio://", StringComparison.OrdinalIgnoreCase))
         {
             var (bucket, key) = ParseMinioPath(path);
-            using var client = CreateS3Client();
+            var client = s3Client.Value;
             await client.DeleteObjectAsync(bucket, key);
             return;
         }
@@ -1405,7 +1399,15 @@ public sealed class MaskFlowStore
             }
 
             nodeFound = true;
-            var job = State.Jobs.Where(x => x.Status == "queued").OrderBy(x => x.CreatedAt).FirstOrDefault();
+            if (node.ApprovedAt is null || node.Status is "disabled" or "suspended")
+            {
+                return;
+            }
+
+            var job = State.Jobs
+                .Where(x => x.Status == "queued" && x.Pool == node.Pool)
+                .OrderBy(x => x.CreatedAt)
+                .FirstOrDefault();
             if (job is null)
             {
                 return;
@@ -1440,14 +1442,56 @@ public sealed class MaskFlowStore
         return task;
     }
 
-    TaskItem? ApplyTaskUpdate(int userId, string taskId, string status, double progress, string? error)
+    TaskItem? ApplyTaskUpdate(int userId, string taskId, string status, double progress, string? error, Dictionary<string, object?>? result = null)
     {
         var task = State.Tasks.FirstOrDefault(x => x.Id == taskId && x.UserId == userId);
         if (task is null) return null;
         State.Tasks.Remove(task);
-        var fresh = task with { Status = status, Progress = progress, ErrorMessage = error, FinishedAt = status is "completed" or "failed" or "cancelled" ? DateTimeOffset.UtcNow : null };
+        var fresh = task with
+        {
+            Status = status,
+            Progress = progress,
+            ErrorMessage = error,
+            Result = result ?? task.Result,
+            FinishedAt = status is "completed" or "failed" or "cancelled" ? DateTimeOffset.UtcNow : null
+        };
         State.Tasks.Add(fresh);
+        SyncJobWithTask(fresh);
         return fresh;
+    }
+
+    static string JobStatusForTask(string taskStatus) => taskStatus switch
+    {
+        "completed" => "succeeded",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        "running" => "running",
+        _ => "queued"
+    };
+
+    // Tasks are tracked as platform jobs; keep the job record in step so it never lingers as "queued".
+    void SyncJobWithTask(TaskItem task)
+    {
+        var job = State.Jobs.FirstOrDefault(x => x.Id == task.JobId);
+        if (job is null) return;
+        var status = JobStatusForTask(task.Status);
+        if (job.Status == status) return;
+        State.Jobs.Remove(job);
+        State.Jobs.Add(job with
+        {
+            Status = status,
+            Error = task.ErrorMessage,
+            StartedAt = job.StartedAt ?? task.StartedAt,
+            FinishedAt = status is "succeeded" or "failed" or "cancelled" ? task.FinishedAt ?? DateTimeOffset.UtcNow : null
+        });
+    }
+
+    void SyncTaskJobStatuses()
+    {
+        foreach (var task in State.Tasks.ToList())
+        {
+            SyncJobWithTask(task);
+        }
     }
 
     Job CreateJobCore(string type, int userId, string? projectId, Dictionary<string, object?> input, Dictionary<string, object?> parameters)
@@ -1506,6 +1550,9 @@ public sealed class MaskFlowStore
         }
     }
 
+    static readonly string DummyPasswordSalt = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+    static readonly string DummyPasswordHash = HashPassword("maskflow-timing-equalizer", DummyPasswordSalt);
+
     static string HashPassword(string password, string salt)
     {
         var bytes = Rfc2898DeriveBytes.Pbkdf2(password, Convert.FromHexString(salt), 150_000, HashAlgorithmName.SHA256, 32);
@@ -1524,10 +1571,12 @@ public sealed class MaskFlowStore
 
     static string FormatYolo(double value) => Clamp01(value).ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
 
-    static string SanitizeFileName(string value)
+    // Zip entry names must be safe on every OS that may extract the dataset, and never traverse ("..").
+    public static string SanitizeFileName(string value)
     {
-        var invalid = Path.GetInvalidFileNameChars();
-        return new string(value.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+        const string invalid = "\\/:*?\"<>|";
+        var cleaned = new string(value.Select(ch => char.IsControl(ch) || invalid.Contains(ch) ? '_' : ch).ToArray()).Trim();
+        return cleaned is "" or "." or ".." ? "_" : cleaned;
     }
 
 }

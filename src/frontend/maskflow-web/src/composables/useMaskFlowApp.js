@@ -276,15 +276,11 @@ export function useMaskFlowApp() {
         method: "POST",
         body: { email: auth.email }
       });
-      if (data.resetToken) {
-        auth.resetToken = data.resetToken;
-        auth.mode = "reset";
-        auth.password = "";
-        auth.confirmPassword = "";
-        message.value = data.message || "请设置新密码完成重置。";
-      } else {
-        message.value = data.message || "如果邮箱存在，请按提示完成重置。";
-      }
+      auth.resetToken = "";
+      auth.mode = "reset";
+      auth.password = "";
+      auth.confirmPassword = "";
+      message.value = data.message || "如果该邮箱已注册，重置码将发送到该邮箱。";
     } catch (error) {
       message.value = error.message;
     } finally {
@@ -1591,6 +1587,7 @@ export function useMaskFlowApp() {
       annotate.status = "请先添加至少一个项目标签";
       return;
     }
+    if (annotate.dirty && !window.confirm("当前图片有未保存修改，运行 AI 会丢弃这些修改（已保存且人工确认的目标会保留）。是否继续？")) return;
     loading.value = true;
     const file = annotate.current;
     const selection = annotationSelection;
@@ -1623,17 +1620,23 @@ export function useMaskFlowApp() {
       annotate.status = "请先添加至少一个项目标签";
       return;
     }
+    let candidates = files.rows.filter((file) => !file.annotated);
+    const skipped = files.rows.length - candidates.length;
+    if (!candidates.length) {
+      if (!window.confirm("所有图片都已有标注。重新运行会替换每张图中未确认的 AI 结果，已人工确认的目标会保留。是否继续？")) return;
+      candidates = [...files.rows];
+    }
+    if (annotate.dirty && !canLeaveCurrentAnnotation()) return;
     loading.value = true;
     const currentId = annotate.current?.id || files.rows[0]?.id;
     const selection = annotationSelection;
     const projectId = projects.selectedId;
-    const candidates = [...files.rows];
     let success = 0;
     let failed = 0;
     try {
       for (const [index, file] of candidates.entries()) {
         if (projectId !== projects.selectedId) break;
-        annotate.status = `AI 自动标注中：${index + 1} / ${files.rows.length} · ${file.name}`;
+        annotate.status = `AI 自动标注中：${index + 1} / ${candidates.length} · ${file.name}`;
         try {
           await runMaskForFile(file, { updateCurrent: file.id === currentId });
           success += 1;
@@ -1645,9 +1648,10 @@ export function useMaskFlowApp() {
       if (selection !== annotationSelection || projectId !== projects.selectedId) return;
       const nextCurrent = files.rows.find((file) => file.id === currentId) || files.rows[0];
       if (nextCurrent) await selectAnnotateFile(nextCurrent);
+      const skippedText = skipped && candidates.length < files.rows.length ? `，跳过 ${skipped} 张已标注图片` : "";
       annotate.status = failed
-        ? `已完成 ${success} 张，失败 ${failed} 张`
-        : `已完成全部 ${success} 张图片的自动标注`;
+        ? `已完成 ${success} 张，失败 ${failed} 张${skippedText}`
+        : `已完成 ${success} 张图片的自动标注${skippedText}`;
     } catch (error) {
       annotate.status = error.message;
     } finally {

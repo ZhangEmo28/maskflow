@@ -1,8 +1,7 @@
 using System.IO.Compression;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 public sealed class DatasetSplitterTests
 {
@@ -124,7 +123,9 @@ public sealed class DatasetSplitterTests
             for (var id = 1; id <= 20; id++)
             {
                 var path = Path.Combine(sourceDir, $"{id}.png");
-                using (var image = new Image<Rgb24>(16, 16)) await image.SaveAsPngAsync(path);
+                using (var image = new SKBitmap(16, 16))
+                using (var png = image.Encode(SKEncodedImageFormat.Png, 100))
+                    await File.WriteAllBytesAsync(path, png.ToArray());
                 var project = id <= 10 ? "p1" : "p2";
                 store.State.Files.Add(new(id, 1, project, $"{id}.png", path, new FileInfo(path).Length, "image", "image/png", now, ""));
                 List<AnnotationItem> annotations =

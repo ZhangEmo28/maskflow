@@ -8,18 +8,24 @@ public sealed class AuthController : ControllerBase
 {
     private readonly MaskFlowStore store;
     private readonly LoginRateLimiter loginRateLimiter;
+    private readonly IWebHostEnvironment environment;
+    private readonly ILogger<AuthController> logger;
 
-    public AuthController(MaskFlowStore store, LoginRateLimiter loginRateLimiter)
+    public AuthController(MaskFlowStore store, LoginRateLimiter loginRateLimiter, IWebHostEnvironment environment, ILogger<AuthController> logger)
     {
         this.store = store;
         this.loginRateLimiter = loginRateLimiter;
+        this.environment = environment;
+        this.logger = logger;
     }
+
+    string ClientIp => HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
     [AllowAnonymous]
     [HttpPost("register")]
-    public async Task<IActionResult> Register([FromBody] RegisterRequest request)
+    public async Task<IActionResult> Register([FromBody] RegisterRequest? request)
     {
-        if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
+        if (request is null || string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
         {
             return BadRequest(new { detail = "Email and password are required." });
         }
@@ -35,10 +41,18 @@ public sealed class AuthController : ControllerBase
 
     [AllowAnonymous]
     [HttpPost("login")]
-    public async Task<IActionResult> Login([FromBody] LoginRequest request)
+    public async Task<IActionResult> Login([FromBody] LoginRequest? request)
     {
-        var rateKey = $"{HttpContext.Connection.RemoteIpAddress}:{request.Email.Trim().ToLowerInvariant()}";
-        if (loginRateLimiter.IsLocked(rateKey, out var retryAfterSeconds))
+        if (request is null || string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
+        {
+            return BadRequest(new { detail = "Email and password are required." });
+        }
+
+        // Two windows: per IP + account slows targeted guessing, per IP alone slows password spraying.
+        var rateKey = $"{ClientIp}:{request.Email.Trim().ToLowerInvariant()}";
+        var ipKey = $"ip:{ClientIp}";
+        if (loginRateLimiter.IsLocked(rateKey, out var retryAfterSeconds)
+            || loginRateLimiter.IsLocked(ipKey, out retryAfterSeconds))
         {
             Response.Headers.RetryAfter = retryAfterSeconds.ToString();
             return StatusCode(429, new { detail = $"Too many login attempts. Retry after {retryAfterSeconds} seconds." });
@@ -48,6 +62,7 @@ public sealed class AuthController : ControllerBase
         if (result is null)
         {
             loginRateLimiter.RecordFailure(rateKey);
+            loginRateLimiter.RecordFailure(ipKey, LoginRateLimiter.MaxAttemptsPerIp);
             return Unauthorized(new { detail = "Invalid email or password." });
         }
 
@@ -64,7 +79,7 @@ public sealed class AuthController : ControllerBase
             return BadRequest(new { detail = "Email is required." });
         }
 
-        var rateKey = $"forgot:{HttpContext.Connection.RemoteIpAddress}:{request.Email.Trim().ToLowerInvariant()}";
+        var rateKey = $"forgot:{ClientIp}:{request.Email.Trim().ToLowerInvariant()}";
         if (loginRateLimiter.IsLocked(rateKey, out var retryAfterSeconds))
         {
             Response.Headers.RetryAfter = retryAfterSeconds.ToString();
@@ -74,22 +89,19 @@ public sealed class AuthController : ControllerBase
         loginRateLimiter.RecordFailure(rateKey);
         var token = store.CreatePasswordResetToken(request.Email);
 
-        // Always acknowledge the request to avoid email enumeration.
-        if (token is not null && store.PasswordResetReturnsToken)
+        // The reset code is a password substitute: it must never travel back in the HTTP response.
+        if (token is not null && environment.IsDevelopment())
         {
-            return Ok(new
-            {
-                ok = true,
-                message = "已生成重置码（30 分钟内有效）。请设置新密码完成找回。",
-                resetToken = token,
-                delivery = "inline"
-            });
+            logger.LogWarning("Development password reset code for {Email}: {Token}", request.Email.Trim().ToLowerInvariant(), token);
         }
 
+        // Always acknowledge the request to avoid email enumeration.
         return Ok(new
         {
             ok = true,
-            message = "如果该邮箱已注册，请使用重置码完成密码重置。当前环境未开启重置码回显时，请联系管理员或配置 MASKFLOW_PASSWORD_RESET_INLINE=true。"
+            message = environment.IsDevelopment()
+                ? "如果该邮箱已注册，重置码已生成。开发环境请在 API 服务日志中查看重置码。"
+                : "如果该邮箱已注册，重置码将发送到该邮箱，30 分钟内有效。"
         });
     }
 
@@ -110,7 +122,7 @@ public sealed class AuthController : ControllerBase
             return BadRequest(new { detail = "Password must be at least 8 characters." });
         }
 
-        var rateKey = $"reset:{HttpContext.Connection.RemoteIpAddress}:{request.Email.Trim().ToLowerInvariant()}";
+        var rateKey = $"reset:{ClientIp}:{request.Email.Trim().ToLowerInvariant()}";
         if (loginRateLimiter.IsLocked(rateKey, out var retryAfterSeconds))
         {
             Response.Headers.RetryAfter = retryAfterSeconds.ToString();

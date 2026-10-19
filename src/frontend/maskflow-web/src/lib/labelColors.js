@@ -34,16 +34,18 @@ export function getLabelColor(label, labels) {
 export function buildAnnotationBoxStyle(item, labels, isActive) {
   const box = item.bbox || { cx: 0.5, cy: 0.5, width: 0.2, height: 0.2 };
   const color = getLabelColor(item.label, labels);
+  // Draw the border outside the true box so the stroke never covers the labelled pixels.
+  const border = isActive ? 3 : 2;
   return {
-    left: `${(box.cx - box.width / 2) * 100}%`,
-    top: `${(box.cy - box.height / 2) * 100}%`,
-    width: `${box.width * 100}%`,
-    height: `${box.height * 100}%`,
+    left: `calc(${(box.cx - box.width / 2) * 100}% - ${border}px)`,
+    top: `calc(${(box.cy - box.height / 2) * 100}% - ${border}px)`,
+    width: `calc(${box.width * 100}% + ${border * 2}px)`,
+    height: `calc(${box.height * 100}% + ${border * 2}px)`,
     borderColor: color.stroke,
     backgroundColor: color.boxBg,
     color: "#fff",
     textShadow: "0 1px 2px rgba(0, 0, 0, 0.55)",
-    borderWidth: isActive ? "3px" : "2px",
+    borderWidth: `${border}px`,
     boxShadow: isActive ? `0 0 0 2px ${color.stroke}, 0 0 0 4px rgba(255, 255, 255, 0.9)` : undefined
   };
 }

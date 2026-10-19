@@ -4,12 +4,26 @@ namespace MaskFlow.Api.Infrastructure.Security;
 
 public sealed class LoginRateLimiter
 {
+    const int SweepThreshold = 4096;
     readonly ConcurrentDictionary<string, AttemptWindow> windows = new();
+    readonly Func<DateTimeOffset> clock;
 
-    static int MaxAttempts =>
+    public LoginRateLimiter() : this(() => DateTimeOffset.UtcNow) { }
+
+    public LoginRateLimiter(Func<DateTimeOffset> clock)
+    {
+        this.clock = clock;
+    }
+
+    public static int MaxAttempts =>
         int.TryParse(Environment.GetEnvironmentVariable("MASKFLOW_LOGIN_MAX_ATTEMPTS"), out var value) && value > 0
             ? value
             : 5;
+
+    public static int MaxAttemptsPerIp =>
+        int.TryParse(Environment.GetEnvironmentVariable("MASKFLOW_LOGIN_MAX_ATTEMPTS_PER_IP"), out var value) && value > 0
+            ? value
+            : 30;
 
     static TimeSpan LockoutDuration
     {
@@ -24,6 +38,8 @@ public sealed class LoginRateLimiter
         }
     }
 
+    public int TrackedKeys => windows.Count;
+
     public bool IsLocked(string key, out int retryAfterSeconds)
     {
         retryAfterSeconds = 0;
@@ -32,13 +48,14 @@ public sealed class LoginRateLimiter
             return false;
         }
 
-        if (window.LockedUntil is { } lockedUntil && lockedUntil > DateTimeOffset.UtcNow)
+        var now = clock();
+        if (window.LockedUntil is { } lockedUntil && lockedUntil > now)
         {
-            retryAfterSeconds = Math.Max(1, (int)Math.Ceiling((lockedUntil - DateTimeOffset.UtcNow).TotalSeconds));
+            retryAfterSeconds = Math.Max(1, (int)Math.Ceiling((lockedUntil - now).TotalSeconds));
             return true;
         }
 
-        if (window.LockedUntil is not null && window.LockedUntil <= DateTimeOffset.UtcNow)
+        if (IsExpired(window, now))
         {
             windows.TryRemove(key, out _);
         }
@@ -46,22 +63,45 @@ public sealed class LoginRateLimiter
         return false;
     }
 
-    public void RecordFailure(string key)
+    public void RecordFailure(string key, int? maxAttempts = null)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = clock();
+        var limit = maxAttempts ?? MaxAttempts;
         windows.AddOrUpdate(
             key,
-            _ => new AttemptWindow(1, now, null),
+            _ => new AttemptWindow(1, now, limit <= 1 ? now + LockoutDuration : null),
             (_, current) =>
             {
-                var failures = current.FirstFailureAt + LockoutDuration < now ? 1 : current.Failures + 1;
-                var firstFailureAt = current.FirstFailureAt + LockoutDuration < now ? now : current.FirstFailureAt;
-                var lockedUntil = failures >= MaxAttempts ? now + LockoutDuration : (DateTimeOffset?)null;
+                var expired = current.FirstFailureAt + LockoutDuration < now;
+                var failures = expired ? 1 : current.Failures + 1;
+                var firstFailureAt = expired ? now : current.FirstFailureAt;
+                var lockedUntil = failures >= limit ? now + LockoutDuration : (DateTimeOffset?)null;
                 return new AttemptWindow(failures, firstFailureAt, lockedUntil);
             });
+
+        if (windows.Count > SweepThreshold)
+        {
+            Sweep(now);
+        }
     }
 
     public void RecordSuccess(string key) => windows.TryRemove(key, out _);
+
+    // Unique keys (IP + email) would otherwise accumulate forever.
+    void Sweep(DateTimeOffset now)
+    {
+        foreach (var (key, window) in windows)
+        {
+            if (IsExpired(window, now))
+            {
+                windows.TryRemove(key, out _);
+            }
+        }
+    }
+
+    static bool IsExpired(AttemptWindow window, DateTimeOffset now) =>
+        (window.LockedUntil is null || window.LockedUntil <= now)
+        && window.FirstFailureAt + LockoutDuration < now;
 
     sealed record AttemptWindow(int Failures, DateTimeOffset FirstFailureAt, DateTimeOffset? LockedUntil);
 }
