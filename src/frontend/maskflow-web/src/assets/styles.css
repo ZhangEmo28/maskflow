@@ -6125,7 +6125,14 @@ body:has(.app-sidebar) {
 
 .canvas-topbar {
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 6px;
   border-bottom: 1px solid #dfe7f3;
+}
+
+.canvas-topbar .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .canvas-topbar span,
@@ -6175,7 +6182,9 @@ body:has(.app-sidebar) {
 .annotate-canvas-panel .yolo-canvas {
   display: flex;
   align-items: flex-start;
-  justify-content: center;
+  /* Center with the frame's auto margins only: flex centering would push a zoomed-in
+     image past the left/top edge where it can no longer be scrolled into view. */
+  justify-content: flex-start;
   height: 100%;
   overflow: auto;
   padding: 18px;
@@ -6314,4 +6323,115 @@ body:has(.app-sidebar) {
   .save-state {
     margin-left: 0;
   }
+}
+
+/* Annotation editing: handles, vertices, pan cursor, shortcut help */
+.annotate-canvas-panel {
+  position: relative;
+}
+
+.yolo-image-frame:not(.drawing):not(.pointing) .yolo-box.active {
+  cursor: move;
+}
+
+.yolo-image-frame.panning,
+.yolo-image-frame.panning .yolo-box {
+  cursor: grab;
+}
+
+.yolo-image-frame.panning .yolo-box,
+.yolo-image-frame.panning .vertex-handle,
+.yolo-image-frame.panning .box-handle {
+  pointer-events: none;
+}
+
+.yolo-image-frame.editing {
+  cursor: grabbing;
+}
+
+.yolo-image-frame img {
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.box-handle {
+  position: absolute;
+  z-index: 6;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 2px solid #0f172a;
+  border-radius: 2px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.35);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.vertex-handle {
+  position: absolute;
+  z-index: 5;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #2563eb;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.55);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.vertex-handle:hover {
+  transform: scale(1.35);
+}
+
+.shortcut-help {
+  position: absolute;
+  top: 56px;
+  right: 16px;
+  z-index: 20;
+  width: min(420px, calc(100% - 32px));
+  max-height: calc(100% - 120px);
+  overflow: auto;
+  padding: 14px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.22);
+}
+
+.shortcut-help-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.shortcut-help dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.shortcut-help dt {
+  white-space: nowrap;
+}
+
+.shortcut-help dd {
+  margin: 0;
+  color: #475569;
+}
+
+.shortcut-help kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid #cbd5e1;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: #f8fafc;
+  font-family: inherit;
+  font-size: 12px;
 }
