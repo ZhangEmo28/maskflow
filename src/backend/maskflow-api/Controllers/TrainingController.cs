@@ -56,6 +56,18 @@ public sealed class TrainingController(MaskFlowStore store, TrainingWorker worke
         return Ok(new { training = MaskFlowStore.TrainingSummary(run) });
     }
 
+    // Readiness of the project's data for a training run (minimums, per-class split, what to add).
+    [HttpPost("projects/{projectId}/trainings/check")]
+    public async Task<IActionResult> Check(string projectId, [FromBody] TrainingRequest request)
+    {
+        var user = CurrentUser();
+        var access = Store.RequireProjectAccess(user.Id, projectId, Permissions.Read);
+        var task = string.IsNullOrWhiteSpace(request.BaseWeight)
+            ? MaskFlowStore.NormalizeDataType(access.Project.DataType) == "segmentation" ? "segment" : "detect"
+            : TrainingReadiness.TaskFromWeightName(request.BaseWeight);
+        return Ok(new { readiness = await Store.CheckTrainingDataAsync(access, request, task) });
+    }
+
     [HttpGet("trainings/{id}")]
     public IActionResult Get(string id)
     {

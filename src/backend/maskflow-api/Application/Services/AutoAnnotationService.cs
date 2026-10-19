@@ -46,6 +46,8 @@ public sealed class SamServiceException(int statusCode, string body, string? con
     }
 }
 
+public sealed record AutoAnnotationResult(AnnotationSet? Annotation, int Detected);
+
 public sealed class AutoAnnotationService(MaskFlowStore store, IHttpClientFactory clientFactory)
 {
     public List<string> Validate(int userId, FileItem file, AutoAnnotationOptions options)
@@ -78,11 +80,14 @@ public sealed class AutoAnnotationService(MaskFlowStore store, IHttpClientFactor
     public AiModel? FindModel(int userId, string? modelId) =>
         modelId is null ? null : store.State.AiModels.FirstOrDefault(x => x.Id == modelId && x.UserId == userId);
 
-    public async Task<AnnotationSet> RunAsync(int userId, FileItem file, AutoAnnotationOptions options, bool recordTask, CancellationToken cancellationToken)
+    // Nothing detected is not an annotation: the image keeps its current state (usually unannotated)
+    // and no quota is charged, so it shows up again among the images still to label.
+    public async Task<AutoAnnotationResult> RunAsync(int userId, FileItem file, AutoAnnotationOptions options, bool recordTask, CancellationToken cancellationToken)
     {
         var request = await PredictAsync(userId, file, options, cancellationToken);
+        if (request.Annotations.Count == 0) return new AutoAnnotationResult(store.GetAnnotationSet(userId, file.Id), 0);
         var (set, _) = await store.PersistAutoAnnotationAsync(userId, request, file, recordTask: recordTask);
-        return set;
+        return new AutoAnnotationResult(set, request.Annotations.Count);
     }
 
     // Runs inference and returns the labelled result without saving it (model evaluation, previews).

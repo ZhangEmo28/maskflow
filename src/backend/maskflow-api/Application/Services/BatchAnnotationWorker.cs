@@ -29,9 +29,19 @@ public sealed class BatchAnnotationWorker(
         if (files.Count == 0) throw new BadHttpRequestException("项目中还没有图片。", 400);
         annotator.Validate(ownerId, files[0], options);
 
-        var annotated = store.State.AnnotationSets.Where(x => x.UserId == ownerId).Select(x => x.FileId).ToHashSet();
-        var fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id))).Select(x => x.Id).ToList();
-        if (fileIds.Count == 0) throw new BadHttpRequestException("没有需要处理的图片：所有图片都已有标注。", 400);
+        List<int> fileIds;
+        if (request.FileIds is { Count: > 0 })
+        {
+            var inProject = files.Select(x => x.Id).ToHashSet();
+            fileIds = request.FileIds.Distinct().Where(inProject.Contains).ToList();
+            if (fileIds.Count != request.FileIds.Distinct().Count()) throw new BadHttpRequestException("所选图片中有不属于该项目或已删除的图片，请刷新后重试。", 400);
+        }
+        else
+        {
+            var annotated = store.State.AnnotationSets.Where(x => x.UserId == ownerId && MaskFlowStore.IsAnnotated(x)).Select(x => x.FileId).ToHashSet();
+            fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id))).Select(x => x.Id).ToList();
+            if (fileIds.Count == 0) throw new BadHttpRequestException("没有需要处理的图片：所有图片都已有标注。", 400);
+        }
 
         var active = store.State.Tasks.Any(x => x.UserId == ownerId && x.ProjectId == access.Project.Id
             && x.Type == MaskFlowStore.BatchAnnotationTaskType && x.Status is "queued" or "running");
@@ -92,6 +102,7 @@ public sealed class BatchAnnotationWorker(
             var file = store.State.Files.FirstOrDefault(x => x.Id == input.FileIds[index] && x.UserId == task.UserId);
             string? error = null;
             var stop = false;
+            var detected = -1;
             if (user is null)
             {
                 error = "用户不存在";
@@ -107,7 +118,7 @@ public sealed class BatchAnnotationWorker(
                 {
                     store.EnsureAiQuotaAvailable(user);
                     await using var slot = await samGate.WaitAsync(cancellationToken);
-                    await annotator.RunAsync(user.Id, file, options, recordTask: false, cancellationToken);
+                    detected = (await annotator.RunAsync(user.Id, file, options, recordTask: false, cancellationToken)).Detected;
                 }
                 catch (BadHttpRequestException ex)
                 {
@@ -131,16 +142,23 @@ public sealed class BatchAnnotationWorker(
                 }
             }
 
-            progress = error is null
-                ? progress with { Processed = progress.Processed + 1, Succeeded = progress.Succeeded + 1 }
-                : progress with { Processed = progress.Processed + 1, Failed = progress.Failed + 1, LastError = error };
+            progress = error is not null
+                ? progress with { Processed = progress.Processed + 1, Failed = progress.Failed + 1, LastError = error }
+                : detected == 0
+                    ? progress with { Processed = progress.Processed + 1, NoTargets = progress.NoTargets + 1 }
+                    : progress with { Processed = progress.Processed + 1, Succeeded = progress.Succeeded + 1 };
             var finalStatus = stop ? "failed" : null;
             var status = await store.RecordBatchProgressAsync(task.Id, progress, total, finalStatus);
             if (status == "failed") await NotifyAsync(task, status, progress);
             if (status != "running") return true;
         }
 
-        var outcome = progress.Succeeded == 0 && progress.Failed > 0 ? "failed" : "completed";
+        // Nothing labelled at all is a failed run, whether every image errored or nothing was detected.
+        var outcome = progress.Succeeded == 0 && progress.Processed > 0 ? "failed" : "completed";
+        if (progress.Succeeded == 0 && progress.NoTargets > 0 && progress.Failed == 0)
+        {
+            progress = progress with { LastError = "所有图片都没有检测到目标：可降低置信度阈值，或检查模型类别名是否与项目标签一致。" };
+        }
         await store.RecordBatchProgressAsync(task.Id, progress, total, outcome);
         await NotifyAsync(task, outcome, progress);
         return true;

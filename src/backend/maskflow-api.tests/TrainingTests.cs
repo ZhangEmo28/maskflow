@@ -118,7 +118,7 @@ public sealed class FakeTrainer : HttpMessageHandler, IHttpClientFactory
 public class TrainingTests
 {
     static async Task<(MaskFlowStore Store, User Owner, Project Project, FakeTrainer Trainer, TrainingWorker Worker, FakeEmailSender Mail)> SetupAsync(
-        int images = 10, string dataType = "detection")
+        int images = 24, string dataType = "detection")
     {
         var (store, _) = TestStore.Create();
         var owner = await TestStore.RegisterAsync(store);
@@ -165,7 +165,7 @@ public class TrainingTests
     [Fact]
     public async Task Create_RejectsIncompatibleWeightsBadParametersAndTinyDatasets()
     {
-        var (store, owner, project, trainer, _, _) = await SetupAsync(images: 10);
+        var (store, owner, project, trainer, _, _) = await SetupAsync();
         async Task<int> Status(TrainingRequest request) =>
             (await Assert.ThrowsAsync<BadHttpRequestException>(() => QueueAsync(store, owner, project, trainer, request))).StatusCode;
 
@@ -175,9 +175,11 @@ public class TrainingTests
         Assert.Equal(400, await Status(new TrainingRequest("yolo11n.pt", Batch: 0)));
         Assert.Equal(400, await Status(new TrainingRequest("yolo11n.pt", Split: new SplitConfig(100, 0, 0))));
 
-        var (tiny, tinyOwner, tinyProject, tinyTrainer, _, _) = await SetupAsync(images: 1);
+        var (tiny, tinyOwner, tinyProject, tinyTrainer, _, _) = await SetupAsync(images: 12);
         var error = await Assert.ThrowsAsync<BadHttpRequestException>(() => QueueAsync(tiny, tinyOwner, tinyProject, tinyTrainer));
-        Assert.Contains("验证集为空", error.Message);
+        Assert.Contains("至少需要 20 张", error.Message);
+        Assert.Contains("类别「car」只有 6 张图片", error.Message);
+        Assert.Contains("建议再补充约 44 张包含「car」的图片", error.Message);
 
         await QueueAsync(store, owner, project, trainer);
         Assert.Equal(409, await Status(new TrainingRequest("yolo11n.pt")));
@@ -201,7 +203,7 @@ public class TrainingTests
             Assert.Contains("data.yaml", names);
             Assert.Contains(names, x => x.StartsWith("images/train/"));
             Assert.Contains(names, x => x.StartsWith("images/val/"));
-            Assert.Equal(10, names.Count(x => x.StartsWith("labels/")));
+            Assert.Equal(24, names.Count(x => x.StartsWith("labels/")));
             using var yaml = new StreamReader(zip.GetEntry("data.yaml")!.Open());
             Assert.Contains("task: detect", yaml.ReadToEnd());
         }

@@ -39,7 +39,13 @@ public sealed partial class MaskFlowStore
         DatasetSplitter.Validate(split);
         if (split.Val <= 0) throw new BadHttpRequestException("训练需要验证集，请把验证集比例设为大于 0。", 400);
         var format = TrainingFormat(weight.Task, access.Project.DataType);
-        var plan = await PlanTrainingDatasetAsync(access.OwnerId, access.Project.Id, format, request with { Split = split });
+        var readiness = await CheckTrainingDataAsync(access, request with { Split = split }, weight.Task);
+        if (!readiness.Ok)
+        {
+            var advice = readiness.Suggestions.Take(3).ToList();
+            throw new BadHttpRequestException("数据还不能训练：" + string.Join(" ", readiness.Blockers)
+                + (advice.Count > 0 ? " 建议：" + string.Join(" ", advice) : ""), 400);
+        }
 
         TrainingRun? run = null;
         await SaveAsync(() =>
@@ -54,7 +60,7 @@ public sealed partial class MaskFlowStore
                 : request.Name.Trim();
             run = new TrainingRun("train_" + Util.Id(), access.OwnerId, access.Project.Id, actorId, name[..Math.Min(name.Length, 200)],
                 weight.Task, format, request with { BaseWeight = weight.Name, Split = split, Name = null }, "queued", 0, [], null, [], null,
-                plan.Files.Count, null, DateTimeOffset.UtcNow, null, null);
+                readiness.Images, null, DateTimeOffset.UtcNow, null, null);
             State.TrainingRuns.Add(run);
         });
         return run!;

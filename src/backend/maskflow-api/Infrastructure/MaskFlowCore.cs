@@ -978,7 +978,8 @@ public sealed partial class MaskFlowStore
             existing?.ReviewComment,
             existing?.ReviewedBy,
             existing?.ReviewedAt,
-            existing?.SubmittedBy);
+            existing?.SubmittedBy,
+            annotations.Count == 0 && request.Background);
         State.AnnotationSets.Add(set);
         return set;
     }
@@ -1233,6 +1234,17 @@ public sealed partial class MaskFlowStore
         });
         return settlement!;
     }
+
+    // An image is annotated once it has a target, or a person marked it as background (no targets).
+    // An empty set otherwise means nothing was found yet, e.g. AI runs that detected nothing in older versions.
+    public static bool IsAnnotated(AnnotationSet? set) => set is not null && (set.Annotations.Count > 0 || set.Background);
+
+    // unannotated | background | pending (some targets await human confirmation) | confirmed
+    public static string AnnotationStatus(AnnotationSet? set) =>
+        !IsAnnotated(set) ? "unannotated"
+        : set!.Annotations.Count == 0 ? "background"
+        : set.Annotations.Any(x => !x.Confirmed) ? "pending"
+        : "confirmed";
 
     public static bool IsExportableAnnotation(AnnotationItem annotation) =>
         !string.IsNullOrWhiteSpace(annotation.Label) && annotation.ClassId >= 0;

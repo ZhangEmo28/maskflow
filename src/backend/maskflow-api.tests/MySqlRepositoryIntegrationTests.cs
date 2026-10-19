@@ -36,6 +36,7 @@ public class MySqlRepositoryIntegrationTests
             await store.SaveAnnotationSetAsync(userId, new AnnotationSaveRequest(files[0].Id, 640, 480,
                 [new AnnotationItem("a1", 1, "安全帽", new YoloBox(0.5, 0.5, 0.2, 0.2), [0.4, 0.4, 0.6, 0.4, 0.6, 0.6], 0.9, true)]));
             await store.SaveProjectLabelsAsync(userId, project.Id, ["安全帽", "car", "person"]);
+            await store.SaveAnnotationSetAsync(userId, new AnnotationSaveRequest(files[2].Id, 640, 480, [], Background: true));
             await store.SaveLabelPromptsAsync(userId, project.Id, new Dictionary<string, string?> { ["安全帽"] = "hard hat" });
             await store.DeleteFileAsync(userId, files[1].Id);
             var weights = new byte[] { 1, 2, 3, 4 };
@@ -66,7 +67,8 @@ public class MySqlRepositoryIntegrationTests
             Assert.Equal(449, state.Files.Count(x => x.ProjectId == project.Id));
             Assert.DoesNotContain(state.Files, x => x.Id == files[1].Id);
             Assert.Equal(["安全帽", "car", "person"], state.ProjectLabels[project.Id]);
-            var set = Assert.Single(state.AnnotationSets);
+            Assert.Equal("background", MaskFlowStore.AnnotationStatus(state.AnnotationSets.Single(x => x.FileId == files[2].Id)));
+            var set = state.AnnotationSets.Single(x => x.FileId == files[0].Id);
             Assert.Equal("安全帽", set.Annotations[0].Label);
             Assert.True(set.Annotations[0].Confirmed);
             Assert.NotNull(reloaded.OptionalUser(WithBearer(auth.Token)));

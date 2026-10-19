@@ -22,6 +22,7 @@ export const SHORTCUT_HELP = [
   ["B", "手动画框模式"],
   ["P", "点提示模式"],
   ["Enter", "点提示模式下添加当前目标"],
+  ["R", "对当前图片运行 AI 标注"],
   ["Esc", "退出当前模式 / 取消选中"],
   ["Ctrl/⌘ + S", "保存"],
   ["Ctrl/⌘ + Z", "撤销"],
@@ -64,6 +65,7 @@ export function resolveShortcut(event) {
     case "KeyC": return { action: "toggleConfirm" };
     case "KeyB": return { action: "drawMode" };
     case "KeyP": return { action: "pointMode" };
+    case "KeyR": return { action: "runAi" };
     case "KeyF": return { action: "fit" };
     case "BracketRight": return { action: "nextAnnotation" };
     case "BracketLeft": return { action: "previousAnnotation" };

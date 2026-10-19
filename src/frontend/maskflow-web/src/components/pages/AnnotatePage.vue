@@ -64,8 +64,9 @@
           </span>
         </div>
         <button class="btn" :disabled="loading || !annotate.ready || !canRunAnnotateAi || !canEditProject" @click="runCurrentMask">运行当前图片</button>
-        <button class="btn secondary" :disabled="loading || batchActive || !files.rows.length || !canRunAnnotateAi || !canEditProject" title="在服务器后台处理，默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
+        <button class="btn secondary" :disabled="loading || batchActive || !files.rows.length || !canRunAnnotateAi || !canEditProject" :title="annotate.selectedIds.length ? '只处理左侧勾选的图片' : '在服务器后台处理，默认只处理未标注的图片'" @click="runMasks">{{ annotate.selectedIds.length ? `AI 标注所选（${annotate.selectedIds.length}）` : '批量运行 AI' }}</button>
         <button class="btn secondary" :disabled="loading || !annotate.ready || !canEditProject || (!annotate.dirty && !(canReviewProject && annotationStats.pending))" @click="saveAnnotation">保存</button>
+        <label class="auto-next-toggle" title="保存后自动打开当前队列里的下一张图片"><input type="checkbox" :checked="annotate.autoNext" @change="toggleAutoNext" />保存后下一张</label>
         <button class="btn ghost" :disabled="!projects.selectedId || !annotate.labels.length || !canReviewProject" :title="canReviewProject ? '' : '导出需要审核员或所有者权限'" @click="createExport">导出 ZIP</button>
       </section>
 
@@ -76,9 +77,9 @@
 
       <section v-if="annotate.batch" :class="['batch-progress', annotate.batch.status]" aria-live="polite">
         <div class="batch-progress-text">
-          <strong>{{ (annotate.batch.type === 'video_propagation' ? '视频传播' : '批量标注') + (batchActive ? (annotate.batch.status === 'queued' ? '排队中' : '进行中') : annotate.batch.status === 'completed' ? '已完成' : annotate.batch.status === 'cancelled' ? '已取消' : '已中止') }}</strong>
-          <span>{{ annotate.batch.processed }} / {{ annotate.batch.total }} 张 · 成功 {{ annotate.batch.succeeded }} · 失败 {{ annotate.batch.failed }}</span>
-          <small v-if="annotate.batch.lastError">最近错误：{{ annotate.batch.lastError }}</small>
+          <strong>{{ (annotate.batch.type === 'video_propagation' ? '视频传播' : '批量标注') + (batchActive ? (annotate.batch.status === 'queued' ? '排队中' : '进行中') : annotate.batch.status === 'completed' ? '已完成' : annotate.batch.status === 'cancelled' ? '已取消' : '未完成') }}</strong>
+          <span>{{ annotate.batch.processed }} / {{ annotate.batch.total }} 张 · 成功 {{ annotate.batch.succeeded }}<template v-if="annotate.batch.noTargets"> · 未检出 {{ annotate.batch.noTargets }}</template> · 失败 {{ annotate.batch.failed }}</span>
+          <small v-if="annotate.batch.lastError">{{ annotate.batch.failed ? '最近错误' : '说明' }}：{{ annotate.batch.lastError }}</small>
         </div>
         <progress :value="annotate.batch.processed" :max="Math.max(1, annotate.batch.total)"></progress>
         <button v-if="batchActive" class="btn secondary compact-btn" type="button" @click="cancelBatch">取消</button>
@@ -86,15 +87,15 @@
       </section>
 
       <section class="annotate-workbench">
-        <aside class="work-card image-queue-panel">
+        <aside :class="['work-card image-queue-panel', { 'drop-over': queueDragOver }]" @dragover.prevent="queueDragOver = canEditProject" @dragleave.self="queueDragOver = false" @drop.prevent="queueDragOver = false; canEditProject && dropFilesToProject($event)">
           <div class="panel-head">
             <div><h2>图片队列</h2><p>{{ files.rows.length }} 张图片</p></div>
           </div>
           <div class="queue-filters" role="tablist" aria-label="图片筛选">
-            <button type="button" :class="{ active: annotate.filter === 'all' }" @click="annotate.filter = 'all'">全部</button>
-            <button type="button" :class="{ active: annotate.filter === 'unannotated' }" @click="annotate.filter = 'unannotated'">未标注</button>
-            <button type="button" :class="{ active: annotate.filter === 'annotated' }" @click="annotate.filter = 'annotated'">已标注</button>
-            <button type="button" :class="{ active: annotate.filter === 'review' }" @click="annotate.filter = 'review'">待复核</button>
+            <button type="button" :class="{ active: annotate.filter === 'all' }" @click="annotate.filter = 'all'">全部 {{ queueCounts.all }}</button>
+            <button type="button" :class="{ active: annotate.filter === 'unannotated' }" title="还没有目标的图片，包括 AI 没检测到目标的" @click="annotate.filter = 'unannotated'">未标注 {{ queueCounts.unannotated }}</button>
+            <button type="button" :class="{ active: annotate.filter === 'review' }" title="有 AI 结果等待人工确认" @click="annotate.filter = 'review'">待确认 {{ queueCounts.review }}</button>
+            <button type="button" :class="{ active: annotate.filter === 'done' }" title="目标都已确认，或已标为背景图" @click="annotate.filter = 'done'">已确认 {{ queueCounts.done }}</button>
           </div>
           <select v-if="isSharedProject" v-model="annotate.reviewQueue" class="queue-sort" aria-label="审核筛选">
             <option value="all">全部审核状态</option>
@@ -109,18 +110,32 @@
             <option value="uncertain">低置信度优先（先复核最不确定的）</option>
             <option value="name">按文件名（视频帧顺序）</option>
           </select>
+          <div class="queue-select-bar">
+            <label :title="'全选当前筛选下的 ' + filteredFiles.length + ' 张'">
+              <input type="checkbox" :checked="filteredFiles.length > 0 && filteredFiles.every(isFileSelected)" :indeterminate.prop="filteredFiles.some(isFileSelected) && !filteredFiles.every(isFileSelected)" @change="setAllSelected(filteredFiles, $event.target.checked)" />
+              {{ annotate.selectedIds.length ? `已选 ${annotate.selectedIds.length} 张` : '多选（Shift 连选）' }}
+            </label>
+            <template v-if="annotate.selectedIds.length">
+              <button type="button" :disabled="!canEditProject || batchActive || !canRunAnnotateAi" title="对所选图片运行 AI 标注（后台）" @click="runMasks">AI 标注</button>
+              <button type="button" :disabled="!canEditProject" title="去掉未确认的 AI 结果，保留人工确认的目标" @click="clearSelectedAnnotations('unconfirmed')">清除未确认</button>
+              <button v-if="canReviewProject" type="button" @click="clearSelectedAnnotations('all')">清除全部标注</button>
+              <button v-if="canReviewProject" type="button" class="danger" @click="deleteSelectedFiles">删除</button>
+              <button type="button" class="plain" @click="clearFileSelection">取消选择</button>
+            </template>
+          </div>
           <div class="queue-list">
-            <button v-for="file in filteredFiles" :key="file.id" :class="['file-row-btn', { active: annotate.current?.id === file.id }]" type="button" @click="selectAnnotateFile(file)">
+            <div v-for="file in filteredFiles" :key="file.id" :class="['file-row-btn', { active: annotate.current?.id === file.id, selected: isFileSelected(file) }]" role="button" tabindex="0" @click="selectAnnotateFile(file)" @keydown.enter.self="selectAnnotateFile(file)">
+              <input class="queue-check" type="checkbox" :checked="isFileSelected(file)" :aria-label="'选择 ' + file.name" @click.stop="toggleFileSelection(file, $event)" />
               <span>{{ file.name }}</span>
               <small>
-                {{ formatBytes(file.size) }} · {{ file.annotated ? file.annotationCount + ' 条标注' : '未标注' }}
+                <em :class="['status-chip', file.status]">{{ fileStatusText[file.status] || '未标注' }}</em>
+                {{ file.annotationCount ? file.annotationCount + ' 个目标' : '' }}
                 <template v-if="file.unconfirmedCount"> · {{ file.unconfirmedCount }} 待复核 · 最低 {{ Number(file.minConfidence).toFixed(2) }}</template>
                 <template v-if="isSharedProject && file.reviewStatus && file.reviewStatus !== 'draft'"> · <em :class="['review-badge', file.reviewStatus]">{{ reviewLabels[file.reviewStatus] }}</em></template>
                 <template v-if="file.assignedToEmail"> · 分配给 {{ file.assignedTo === account?.id ? '我' : file.assignedToEmail }}</template>
               </small>
               <i v-if="canReviewProject" class="queue-delete-btn" title="删除图片" @click.stop="deleteAnnotateFile(file)">删除</i>
-              <b :class="['file-status-dot', { done: file.annotated }]" title="已执行自动标注"></b>
-            </button>
+            </div>
             <div v-if="!filteredFiles.length" class="empty-note">当前筛选下没有图片。</div>
           </div>
           <p class="queue-status">{{ annotate.status }}</p>
@@ -147,6 +162,8 @@
             <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ filteredFiles.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
             <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex >= filteredFiles.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
             <button class="btn ghost compact-btn" type="button" title="快捷键 (?)" @click="annotate.showShortcutHelp = !annotate.showShortcutHelp">快捷键</button>
+            <span v-if="annotate.ready && annotate.background && !annotate.annotations.length" class="status-chip background" title="已检查过、确实没有目标；训练时作为负样本">背景图（无目标）</span>
+            <button v-else-if="annotate.ready && !annotate.annotations.length && canEditProject" class="btn secondary compact-btn" type="button" :disabled="loading" title="这张图确实没有任何目标：保存为背景图，训练时作为负样本，能减少误检" @click="markBackground">标为背景图</button>
             <span v-if="currentFrame" class="frame-tools">
               视频帧 #{{ currentFrame.frameIndex }}
               <input v-model.number="annotate.propagateCount" type="number" min="1" max="500" aria-label="传播帧数" />
@@ -428,7 +445,7 @@
 </template>
 
 <script setup>
-import { inject } from "vue";
+import { inject, ref } from "vue";
 import TeamPanel from "../TeamPanel.vue";
 import { HANDLES, handleCursor } from "../../lib/boxEditing";
 import { SHORTCUT_HELP } from "../../lib/shortcuts";
@@ -513,6 +530,18 @@ const applyAnnotationLabel = inject("applyAnnotationLabel");
 const toggleAnnotationConfirmed = inject("toggleAnnotationConfirmed");
 const changeAnnotateFiles = inject("changeAnnotateFiles");
 const deleteFile = inject("deleteFile");
+const queueCounts = inject("queueCounts");
+const fileStatusText = inject("fileStatusText");
+const isFileSelected = inject("isFileSelected");
+const toggleFileSelection = inject("toggleFileSelection");
+const setAllSelected = inject("setAllSelected");
+const clearFileSelection = inject("clearFileSelection");
+const clearSelectedAnnotations = inject("clearSelectedAnnotations");
+const deleteSelectedFiles = inject("deleteSelectedFiles");
+const markBackground = inject("markBackground");
+const toggleAutoNext = inject("toggleAutoNext");
+const dropFilesToProject = inject("dropFilesToProject");
+const queueDragOver = ref(false);
 const previewUrl = inject("previewUrl");
 const downloadCurrentTxt = inject("downloadCurrentTxt");
 const selectProject = inject("selectProject");
@@ -547,8 +576,8 @@ function onAnnotationLabelChange(item, value) {
 
 async function deleteAnnotateFile(file) {
   if (!file?.id) return;
-  const message = file.annotated
-    ? `确定删除 ${file.name} 吗？这张图的 ${file.annotationCount || 0} 条标注也会一起删除。`
+  const message = file.annotationCount
+    ? `确定删除 ${file.name} 吗？这张图的 ${file.annotationCount} 个目标也会一起删除。`
     : `确定删除 ${file.name} 吗？`;
   if (!window.confirm(message)) return;
   await deleteFile(file.id);

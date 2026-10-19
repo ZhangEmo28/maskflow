@@ -140,7 +140,7 @@ public static class QualityCheck
 
         foreach (var file in files)
         {
-            if (!sets.TryGetValue(file.Id, out var set))
+            if (!sets.TryGetValue(file.Id, out var set) || !MaskFlowStore.IsAnnotated(set))
             {
                 unannotated++;
                 continue;
@@ -229,7 +229,7 @@ public static class QualityCheck
         {
             images = files.Count,
             unannotatedImages = unannotated,
-            imagesWithoutTargets = empty,
+            backgroundImages = empty,
             targets,
             confirmedTargets = confirmed,
             unconfirmedTargets = targets - confirmed,
@@ -334,5 +334,54 @@ public sealed partial class MaskFlowStore
             }
         });
         return (targets, images);
+    }
+}
+
+public sealed partial class MaskFlowStore
+{
+    // ---- Bulk operations on selected images (one write each) ----
+
+    public async Task<int> DeleteFilesAsync(int ownerId, string projectId, IReadOnlyCollection<int> fileIds)
+    {
+        var deleted = 0;
+        await SaveAsync(() =>
+        {
+            foreach (var fileId in fileIds.Distinct())
+            {
+                var file = State.Files.FirstOrDefault(x => x.Id == fileId && x.UserId == ownerId && x.ProjectId == projectId);
+                if (file is not null && DeleteFileCoreLocked(ownerId, fileId)) deleted++;
+            }
+        });
+        return deleted;
+    }
+
+    // "all": the images become unannotated. "unconfirmed": AI results awaiting review are removed and
+    // human-confirmed targets stay; an image left without targets becomes unannotated again.
+    public async Task<(int Images, int Targets)> ClearAnnotationsAsync(int ownerId, string projectId, IReadOnlyCollection<int> fileIds, bool unconfirmedOnly)
+    {
+        var images = 0;
+        var targets = 0;
+        await SaveAsync(() =>
+        {
+            var selected = State.Files.Where(x => x.UserId == ownerId && x.ProjectId == projectId && fileIds.Contains(x.Id)).Select(x => x.Id).ToHashSet();
+            foreach (var set in State.AnnotationSets.Where(x => x.UserId == ownerId && selected.Contains(x.FileId)).ToList())
+            {
+                var kept = unconfirmedOnly ? set.Annotations.Where(x => x.Confirmed).ToList() : [];
+                var removed = set.Annotations.Count - kept.Count;
+                if (removed == 0 && (unconfirmedOnly || !set.Background)) continue;
+                if (kept.Count == 0)
+                {
+                    State.AnnotationSets.Remove(set);
+                }
+                else
+                {
+                    ApplyAnnotationSet(ownerId, new AnnotationSaveRequest(set.FileId, set.Width, set.Height, kept));
+                }
+
+                images++;
+                targets += removed;
+            }
+        });
+        return (images, targets);
     }
 }

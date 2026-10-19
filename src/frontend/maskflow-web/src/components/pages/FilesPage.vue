@@ -1,5 +1,5 @@
 <script setup>
-import { inject } from "vue";
+import { computed, inject, ref } from "vue";
 
 const projects = inject("projects");
 const selectedProject = inject("selectedProject");
@@ -21,6 +21,39 @@ const formatDateTime = inject("formatDateTime");
 const videos = inject("videos");
 const uploadVideo = inject("uploadVideo");
 const deleteVideo = inject("deleteVideo");
+const annotate = inject("annotate");
+const fileStatusText = inject("fileStatusText");
+const fileStatusGroup = inject("fileStatusGroup");
+const isFileSelected = inject("isFileSelected");
+const toggleFileSelection = inject("toggleFileSelection");
+const setAllSelected = inject("setAllSelected");
+const clearFileSelection = inject("clearFileSelection");
+const clearSelectedAnnotations = inject("clearSelectedAnnotations");
+const deleteSelectedFiles = inject("deleteSelectedFiles");
+const canReviewProject = inject("canReviewProject");
+const go = inject("go");
+const dropFilesToProject = inject("dropFilesToProject");
+const dragOver = ref(false);
+
+function chooseFiles(event) {
+  files.selected = event.target.files;
+  uploadFiles();
+  event.target.value = "";
+}
+
+function onDrop(event) {
+  dragOver.value = false;
+  dropFilesToProject(event);
+}
+
+const statusFilter = ref("all");
+const visibleFiles = computed(() => statusFilter.value === "all" ? files.rows : files.rows.filter((file) => fileStatusGroup(file) === statusFilter.value));
+const allVisibleSelected = computed(() => visibleFiles.value.length > 0 && visibleFiles.value.every(isFileSelected));
+
+async function confirmDelete(file) {
+  const detail = file.annotationCount ? `，它的 ${file.annotationCount} 个目标也会一起删除` : "";
+  if (window.confirm(`删除 ${file.name}${detail}？`)) await deleteFile(file.id);
+}
 </script>
 
 <template>
@@ -49,9 +82,11 @@ const deleteVideo = inject("deleteVideo");
         <div class="files-side-column">
         <article class="work-card">
           <h2>上传图片</h2>
-          <input type="file" multiple accept="image/*" @change="files.selected = $event.target.files" />
-          <p>{{ files.selected?.length ? '已选择 ' + files.selected.length + ' 个文件' : '支持批量选择图片文件。' }}</p>
-          <button class="btn" :disabled="loading || !files.selected?.length || !projects.selectedId" @click="uploadFiles">上传到当前项目</button>
+          <label :class="['drop-zone', { over: dragOver, disabled: loading || !projects.selectedId }]" @dragover.prevent="dragOver = true" @dragleave="dragOver = false" @drop.prevent="onDrop">
+            <input type="file" multiple accept="image/*" :disabled="loading || !projects.selectedId" @change="chooseFiles" />
+            <strong>{{ projects.selectedId ? '拖拽图片到这里，或点击选择' : '请先选择或创建项目' }}</strong>
+            <small>可一次选择多张，选择后立即上传到当前项目</small>
+          </label>
           <div v-if="uploadQueue.items.length" class="upload-queue-panel compact">
             <div class="upload-queue-head">
               <strong>上传进度</strong>
@@ -132,17 +167,44 @@ const deleteVideo = inject("deleteVideo");
         </article>
         </div>
         <article class="work-card wide">
-          <h2>文件列表</h2>
+          <div class="files-table-head">
+            <h2>文件列表 <small>{{ files.rows.length }} 张</small></h2>
+            <select v-model="statusFilter" aria-label="按状态筛选">
+              <option value="all">全部状态</option>
+              <option value="unannotated">未标注</option>
+              <option value="review">待确认</option>
+              <option value="done">已确认 / 背景图</option>
+            </select>
+          </div>
+          <div v-if="annotate.selectedIds.length" class="files-bulk-bar">
+            <strong>已选 {{ annotate.selectedIds.length }} 张</strong>
+            <button class="btn secondary compact-btn" type="button" @click="go('/annotate.html')">去标注页 AI 标注</button>
+            <button class="btn secondary compact-btn" type="button" title="去掉未确认的 AI 结果，保留人工确认的目标" @click="clearSelectedAnnotations('unconfirmed')">清除未确认</button>
+            <button v-if="canReviewProject" class="btn secondary compact-btn" type="button" @click="clearSelectedAnnotations('all')">清除全部标注</button>
+            <button v-if="canReviewProject" class="btn danger compact-btn" type="button" @click="deleteSelectedFiles">删除所选</button>
+            <button class="btn ghost compact-btn" type="button" @click="clearFileSelection">取消选择</button>
+          </div>
           <table>
+            <thead>
+              <tr>
+                <th class="check-cell"><input type="checkbox" :checked="allVisibleSelected" :indeterminate.prop="visibleFiles.some(isFileSelected) && !allVisibleSelected" title="全选当前筛选" @change="setAllSelected(visibleFiles, $event.target.checked)" /></th>
+                <th>文件名</th>
+                <th>大小</th>
+                <th>状态</th>
+                <th>上传时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
             <tbody>
-              <tr v-for="file in files.rows" :key="file.id">
+              <tr v-for="file in visibleFiles" :key="file.id" :class="{ 'row-selected': isFileSelected(file) }">
+                <td class="check-cell"><input type="checkbox" :checked="isFileSelected(file)" :aria-label="'选择 ' + file.name" @click="toggleFileSelection(file, $event, visibleFiles)" /></td>
                 <td>{{ file.name }}</td>
                 <td>{{ formatBytes(file.size) }}</td>
-                <td>{{ file.annotationCount || 0 }} 条标注</td>
+                <td><em :class="['status-chip', file.status]">{{ fileStatusText[file.status] || '未标注' }}</em> {{ file.annotationCount ? file.annotationCount + ' 个目标' : '' }}</td>
                 <td>{{ formatDateTime(file.createdAt) }}</td>
-                <td><a href="#" @click.prevent="downloadFileItem(file)">下载</a> <button class="text-danger" type="button" @click="deleteFile(file.id)">删除</button></td>
+                <td><a href="#" @click.prevent="downloadFileItem(file)">下载</a> <button v-if="canReviewProject" class="text-danger" type="button" @click="confirmDelete(file)">删除</button></td>
               </tr>
-              <tr v-if="!files.rows.length"><td colspan="5">当前项目暂无图片文件。</td></tr>
+              <tr v-if="!visibleFiles.length"><td colspan="6">{{ files.rows.length ? '当前筛选下没有图片。' : '当前项目暂无图片文件。' }}</td></tr>
             </tbody>
           </table>
         </article>
