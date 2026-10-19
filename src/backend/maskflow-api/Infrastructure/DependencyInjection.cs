@@ -11,6 +11,10 @@ public static class DependencyInjection
         services.AddSingleton<MaskFlowStore>();
         services.AddSingleton<LoginRateLimiter>();
         services.AddSingleton<SamInferenceGate>();
+        services.AddSingleton<IEmailSender>(provider => SmtpSettings.FromEnvironment() is { } smtp
+            ? new SmtpEmailSender(smtp)
+            : ActivatorUtilities.CreateInstance<LoggingEmailSender>(provider));
+        services.AddSingleton<AccountMailer>();
         return services;
     }
 }

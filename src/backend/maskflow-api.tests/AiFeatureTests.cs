@@ -6,6 +6,18 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MaskFlow.Api.Tests;
 
+sealed class FakeEmailSender : IEmailSender
+{
+    public bool IsConfigured => true;
+    public List<(string To, string Subject, string Body)> Sent { get; } = [];
+
+    public Task SendAsync(string to, string subject, string body, CancellationToken cancellationToken = default)
+    {
+        Sent.Add((to, subject, body));
+        return Task.CompletedTask;
+    }
+}
+
 sealed class FakeSam : HttpMessageHandler, IHttpClientFactory
 {
     readonly Func<HttpRequestMessage, string, (HttpStatusCode Status, string Body)> respond;
@@ -54,8 +66,10 @@ static class AiFixture
         return (store, user, project, files, dir);
     }
 
-    public static BatchAnnotationWorker Worker(MaskFlowStore store, FakeSam sam) =>
-        new(store, new AutoAnnotationService(store, sam), new SamInferenceGate(), NullLogger<BatchAnnotationWorker>.Instance);
+    public static BatchAnnotationWorker Worker(MaskFlowStore store, FakeSam sam, FakeEmailSender? mail = null) =>
+        new(store, new AutoAnnotationService(store, sam), new SamInferenceGate(),
+            new AccountMailer(mail ?? new FakeEmailSender(), NullLogger<AccountMailer>.Instance),
+            NullLogger<BatchAnnotationWorker>.Instance);
 }
 
 public class AiParserTests
@@ -141,10 +155,14 @@ public class BatchAnnotationTests
         {
             await store.SaveLabelPromptsAsync(user.Id, project.Id, new Dictionary<string, string?> { ["car"] = "sedan car" });
             var sam = new FakeSam((request, _) => (HttpStatusCode.OK, AiFixture.ConceptResponse));
+            var mail = new FakeEmailSender();
             var task = await store.CreateBatchAnnotationTaskAsync(user.Id,
                 new AnnotationBatchRequest(project.Id, 0.3, null, "concepts"), files.Select(x => x.Id).ToList());
 
-            Assert.True(await AiFixture.Worker(store, sam).RunNextAsync(CancellationToken.None));
+            Assert.True(await AiFixture.Worker(store, sam, mail).RunNextAsync(CancellationToken.None));
+            var notice = Assert.Single(mail.Sent);
+            Assert.Equal(user.Email, notice.To);
+            Assert.Contains("成功 3", notice.Body);
 
             var done = store.State.Tasks.Single(x => x.Id == task.Id);
             Assert.Equal("completed", done.Status);

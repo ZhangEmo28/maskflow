@@ -9,14 +9,14 @@ public sealed class AuthController : ControllerBase
     private readonly MaskFlowStore store;
     private readonly LoginRateLimiter loginRateLimiter;
     private readonly IWebHostEnvironment environment;
-    private readonly ILogger<AuthController> logger;
+    private readonly AccountMailer mailer;
 
-    public AuthController(MaskFlowStore store, LoginRateLimiter loginRateLimiter, IWebHostEnvironment environment, ILogger<AuthController> logger)
+    public AuthController(MaskFlowStore store, LoginRateLimiter loginRateLimiter, IWebHostEnvironment environment, AccountMailer mailer)
     {
         this.store = store;
         this.loginRateLimiter = loginRateLimiter;
         this.environment = environment;
-        this.logger = logger;
+        this.mailer = mailer;
     }
 
     string ClientIp => HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
@@ -72,7 +72,7 @@ public sealed class AuthController : ControllerBase
 
     [AllowAnonymous]
     [HttpPost("forgot-password")]
-    public IActionResult ForgotPassword([FromBody] ForgotPasswordRequest? request)
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest? request)
     {
         if (request is null || string.IsNullOrWhiteSpace(request.Email))
         {
@@ -89,19 +89,22 @@ public sealed class AuthController : ControllerBase
         loginRateLimiter.RecordFailure(rateKey);
         var token = store.CreatePasswordResetToken(request.Email);
 
-        // The reset code is a password substitute: it must never travel back in the HTTP response.
-        if (token is not null && environment.IsDevelopment())
+        // The reset code is a password substitute: it is only ever emailed, never returned here.
+        // Without SMTP, Development logs the mail (including the code); Production sends nothing.
+        if (token is not null)
         {
-            logger.LogWarning("Development password reset code for {Email}: {Token}", request.Email.Trim().ToLowerInvariant(), token);
+            await mailer.SendPasswordResetAsync(request.Email.Trim().ToLowerInvariant(), token);
         }
 
         // Always acknowledge the request to avoid email enumeration.
         return Ok(new
         {
             ok = true,
-            message = environment.IsDevelopment()
-                ? "如果该邮箱已注册，重置码已生成。开发环境请在 API 服务日志中查看重置码。"
-                : "如果该邮箱已注册，重置码将发送到该邮箱，30 分钟内有效。"
+            message = mailer.CanDeliver
+                ? "如果该邮箱已注册，重置码将发送到该邮箱，30 分钟内有效。"
+                : environment.IsDevelopment()
+                    ? "如果该邮箱已注册，重置码已生成。开发环境未配置邮件服务，请在 API 服务日志中查看重置码。"
+                    : "系统未配置邮件服务，暂时无法通过邮件找回密码，请联系管理员。"
         });
     }
 
