@@ -21,7 +21,9 @@
 
 - **Project-based image management** — upload, download, delete, and inspect annotation status in batches.
 - **SAM 3 segmentation** — automatic detection, text prompts, positive and negative points, and multi-object confirmation.
-- **YOLO review** — automatic annotation, manual boxes, label management, filtering, and human confirmation.
+- **Label-driven auto annotation** — SAM 3 is prompted with your project labels (optionally with English prompts) so every mask arrives with its class; you can also pre-annotate with your own YOLO model exported to ONNX.
+- **Background batch runs** — batch AI runs as a server-side task with progress, cancel and resume after restarts; human-confirmed targets are never overwritten.
+- **Fast review** — move/resize boxes, edit polygon vertices, undo/redo, keyboard shortcuts, wheel zoom and space-drag panning, and a lowest-confidence-first review queue.
 - **Training dataset export** — YOLO detection, YOLO segmentation, or classification crops with train / val / test splits.
 - **Task tracking** — processing history, AI usage quotas, and project-level statistics.
 - **Self-hosted deployment** — Docker Compose runs the Vue frontend, .NET API, FastAPI inference service, MySQL, and MinIO.

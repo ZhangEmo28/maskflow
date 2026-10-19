@@ -112,7 +112,7 @@ public class MaskFlowStoreTests
         ]), file);
 
         Assert.Equal(["human", "ann_new"], set.Annotations.Select(x => x.Id));
-        Assert.Equal("completed", task.Status);
+        Assert.Equal("completed", task!.Status);
         Assert.Equal("succeeded", store.State.Jobs.Single(x => x.Id == task.JobId).Status);
     }
 

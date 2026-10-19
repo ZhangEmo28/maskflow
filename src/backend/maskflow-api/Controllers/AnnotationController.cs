@@ -10,90 +10,83 @@ public sealed class AnnotationController : ControllerBase
     private readonly MaskFlowStore store;
     private readonly IHttpClientFactory clientFactory;
     private readonly SamInferenceGate samGate;
+    private readonly AutoAnnotationService annotator;
+    private readonly BatchAnnotationWorker worker;
 
-    public AnnotationController(MaskFlowStore store, IHttpClientFactory clientFactory, SamInferenceGate samGate)
+    public AnnotationController(MaskFlowStore store, IHttpClientFactory clientFactory, SamInferenceGate samGate, AutoAnnotationService annotator, BatchAnnotationWorker worker)
     {
         this.store = store;
         this.clientFactory = clientFactory;
         this.samGate = samGate;
+        this.annotator = annotator;
+        this.worker = worker;
     }
 
     [HttpPost("/api/annotations/auto")]
     public async Task<IActionResult> Auto([FromBody] AnnotationAutoRequest request)
     {
         var user = store.RequireUser(HttpContext);
-        try
-        {
-            store.EnsureAiQuotaAvailable(user);
-        }
-        catch (BadHttpRequestException ex)
-        {
-            return StatusCode(ex.StatusCode, new { detail = ex.Message });
-        }
-
+        store.EnsureAiQuotaAvailable(user);
         var file = store.State.Files.FirstOrDefault(x => x.Id == request.FileId && x.UserId == user.Id);
         if (file is null || !await store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
-        if (string.IsNullOrWhiteSpace(file.ProjectId))
-        {
-            return BadRequest(new { detail = "File must belong to a project before auto annotation." });
-        }
 
-        var projectLabels = store.GetProjectLabels(user.Id, file.ProjectId);
-        if (projectLabels.Count == 0)
-        {
-            return BadRequest(new { detail = "Add at least one label to the project before running auto annotation." });
-        }
-
-        if (!string.IsNullOrWhiteSpace(request.DefaultLabel)
-            && MaskFlowStore.ResolveLabelClassId(request.DefaultLabel, projectLabels) < 0)
-        {
-            return BadRequest(new { detail = "DefaultLabel is not in project labels." });
-        }
-
+        var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
+        annotator.Validate(user.Id, file, options);
         await using var slot = await samGate.TryAcquireAsync(HttpContext.RequestAborted);
         if (slot is null)
         {
             return StatusCode(StatusCodes.Status429TooManyRequests, new { detail = "Too many concurrent AI requests. Try again shortly." });
         }
 
-        using var content = new MultipartFormDataContent();
-        await using var stream = await store.OpenStoredObjectAsync(file.Path);
-        var fileContent = new StreamContent(stream);
-        fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(file.ContentType ?? "application/octet-stream");
-        content.Add(fileContent, "image", file.Name);
-        content.Add(new StringContent(request.Conf.ToString(CultureInfo.InvariantCulture)), "conf");
-
         try
         {
-            var client = clientFactory.CreateClient("sam");
-            var response = await client.PostAsync("/api/annotation/masks", content, HttpContext.RequestAborted);
-            var body = await response.Content.ReadAsStringAsync(HttpContext.RequestAborted);
-            if (!response.IsSuccessStatusCode)
-            {
-                return new ContentResult
-                {
-                    Content = body,
-                    ContentType = response.Content.Headers.ContentType?.ToString() ?? "application/json",
-                    StatusCode = (int)response.StatusCode
-                };
-            }
-
-            var saveRequest = AutoAnnotationParser.Parse(file.Id, body, request.DefaultLabel, projectLabels);
-            var (set, _) = await store.PersistAutoAnnotationAsync(user.Id, saveRequest, file);
+            var set = await annotator.RunAsync(user.Id, file, options, recordTask: true, HttpContext.RequestAborted);
             return Ok(new { annotation = set, user = store.PublicUser(store.GetUser(user.Id)!) });
         }
-        catch (BadHttpRequestException ex)
+        catch (SamServiceException ex)
         {
-            return StatusCode(ex.StatusCode, new { detail = ex.Message });
+            return new ContentResult { Content = ex.Body, ContentType = ex.ContentType ?? "application/json", StatusCode = ex.StatusCode };
         }
         catch (HttpRequestException ex)
         {
             return StatusCode(503, new { detail = $"SAM inference service is unavailable: {ex.Message}" });
         }
-        catch (TaskCanceledException)
+        catch (TaskCanceledException) when (!HttpContext.RequestAborted.IsCancellationRequested)
         {
             return StatusCode(504, new { detail = "SAM inference service request timed out." });
         }
+    }
+
+    // Queues server-side auto annotation for many images; progress is polled via /api/tasks/{id}.
+    [HttpPost("/api/annotations/batch")]
+    public async Task<IActionResult> Batch([FromBody] AnnotationBatchRequest request)
+    {
+        var user = store.RequireUser(HttpContext);
+        store.EnsureAiQuotaAvailable(user);
+        var project = store.State.Projects.FirstOrDefault(x => x.Id == request.ProjectId && x.UserId == user.Id);
+        if (project is null) return NotFound(new { detail = "Project not found." });
+
+        var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
+        var files = store.State.Files
+            .Where(x => x.UserId == user.Id && x.ProjectId == project.Id && x.Kind == "image")
+            .OrderBy(x => x.Id)
+            .ToList();
+        if (files.Count == 0) return BadRequest(new { detail = "项目中还没有图片。" });
+        annotator.Validate(user.Id, files[0], options);
+
+        var annotated = store.State.AnnotationSets.Where(x => x.UserId == user.Id).Select(x => x.FileId).ToHashSet();
+        var fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id)))
+            .Select(x => x.Id)
+            .ToList();
+        if (fileIds.Count == 0) return BadRequest(new { detail = "没有需要处理的图片：所有图片都已有标注。" });
+
+        var active = store.State.Tasks.Any(x => x.UserId == user.Id && x.ProjectId == project.Id
+            && x.Type == MaskFlowStore.BatchAnnotationTaskType && x.Status is "queued" or "running");
+        if (active) return Conflict(new { detail = "该项目已有正在进行的批量标注任务。" });
+
+        var task = await store.CreateBatchAnnotationTaskAsync(user.Id, request with { Mode = options.Mode }, fileIds);
+        worker.Wake();
+        return Ok(new { task });
     }
 
     [HttpPost("/api/annotations/points")]

@@ -37,7 +37,15 @@
           <span>上传图片</span>
         </label>
         <label class="inline-control">置信度 {{ annotate.conf }}<input v-model="annotate.conf" type="range" min="0.01" max="0.95" step="0.01" /></label>
-        <label class="inline-control annotate-default-label">
+        <label class="inline-control annotate-ai-mode">
+          AI 方式
+          <select :value="aiModeValue" :disabled="!annotate.labels.length" @change="setAiMode($event.target.value)">
+            <option value="concepts">按标签识别（SAM 3 文本提示）</option>
+            <option value="everything">分割一切（统一默认类别）</option>
+            <option v-for="model in annotate.models" :key="model.id" :value="'model:' + model.id">自定义模型：{{ model.name }}</option>
+          </select>
+        </label>
+        <label v-if="effectiveAiMode === 'everything'" class="inline-control annotate-default-label">
           本次默认类别
           <select v-model="annotate.defaultRunLabel" :disabled="!annotate.labels.length">
             <option value="">未分配</option>
@@ -51,12 +59,26 @@
           </span>
         </div>
         <button class="btn" :disabled="loading || !annotate.ready || !canRunAnnotateAi" @click="runCurrentMask">运行当前图片</button>
-        <button class="btn secondary" :disabled="loading || !files.rows.length || !canRunAnnotateAi" title="默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
+        <button class="btn secondary" :disabled="loading || batchActive || !files.rows.length || !canRunAnnotateAi" title="在服务器后台处理，默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
         <button class="btn secondary" :disabled="loading || !annotate.ready || (!annotate.dirty && !annotationStats.pending)" @click="saveAnnotation">保存</button>
         <button class="btn ghost" :disabled="!projects.selectedId || !annotate.labels.length" @click="createExport">导出 ZIP</button>
       </section>
 
       <p v-if="!annotate.labels.length" class="annotate-label-hint">请先添加至少一个项目标签，再运行 AI 自动标注。</p>
+      <p v-else-if="effectiveAiMode === 'concepts' && labelsNeedingPrompt.length" class="annotate-label-hint">
+        SAM 3 按英文提示词识别，建议在右侧标签栏为「{{ labelsNeedingPrompt.join('、') }}」填写英文提示词（例如 安全帽 → hard hat）。
+      </p>
+
+      <section v-if="annotate.batch" :class="['batch-progress', annotate.batch.status]" aria-live="polite">
+        <div class="batch-progress-text">
+          <strong>{{ batchActive ? (annotate.batch.status === 'queued' ? '批量标注排队中' : '批量标注进行中') : annotate.batch.status === 'completed' ? '批量标注已完成' : annotate.batch.status === 'cancelled' ? '批量标注已取消' : '批量标注已中止' }}</strong>
+          <span>{{ annotate.batch.processed }} / {{ annotate.batch.total }} 张 · 成功 {{ annotate.batch.succeeded }} · 失败 {{ annotate.batch.failed }}</span>
+          <small v-if="annotate.batch.lastError">最近错误：{{ annotate.batch.lastError }}</small>
+        </div>
+        <progress :value="annotate.batch.processed" :max="Math.max(1, annotate.batch.total)"></progress>
+        <button v-if="batchActive" class="btn secondary compact-btn" type="button" @click="cancelBatch">取消</button>
+        <button v-else class="btn ghost compact-btn" type="button" @click="annotate.batch = null">关闭</button>
+      </section>
 
       <section class="annotate-workbench">
         <aside class="work-card image-queue-panel">
@@ -67,11 +89,19 @@
             <button type="button" :class="{ active: annotate.filter === 'all' }" @click="annotate.filter = 'all'">全部</button>
             <button type="button" :class="{ active: annotate.filter === 'unannotated' }" @click="annotate.filter = 'unannotated'">未标注</button>
             <button type="button" :class="{ active: annotate.filter === 'annotated' }" @click="annotate.filter = 'annotated'">已标注</button>
+            <button type="button" :class="{ active: annotate.filter === 'review' }" @click="annotate.filter = 'review'">待复核</button>
           </div>
+          <select v-model="annotate.queueSort" class="queue-sort" aria-label="图片排序">
+            <option value="default">默认顺序</option>
+            <option value="uncertain">低置信度优先（先复核最不确定的）</option>
+          </select>
           <div class="queue-list">
             <button v-for="file in filteredFiles" :key="file.id" :class="['file-row-btn', { active: annotate.current?.id === file.id }]" type="button" @click="selectAnnotateFile(file)">
               <span>{{ file.name }}</span>
-              <small>{{ formatBytes(file.size) }} · {{ file.annotated ? file.annotationCount + ' 条标注' : '未标注' }}</small>
+              <small>
+                {{ formatBytes(file.size) }} · {{ file.annotated ? file.annotationCount + ' 条标注' : '未标注' }}
+                <template v-if="file.unconfirmedCount"> · {{ file.unconfirmedCount }} 待复核 · 最低 {{ Number(file.minConfidence).toFixed(2) }}</template>
+              </small>
               <i class="queue-delete-btn" title="删除图片" @click.stop="deleteAnnotateFile(file)">删除</i>
               <b :class="['file-status-dot', { done: file.annotated }]" title="已执行自动标注"></b>
             </button>
@@ -98,8 +128,8 @@
             <button class="btn secondary compact-btn" type="button" :disabled="!annotate.canUndo" title="撤销 (Ctrl/⌘+Z)" @click="undoAnnotationEdit">撤销</button>
             <button class="btn secondary compact-btn" type="button" :disabled="!annotate.canRedo" title="重做 (Ctrl/⌘+Shift+Z)" @click="redoAnnotationEdit">重做</button>
             <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex <= 0" title="上一张 (A)" @click="selectAdjacentFile(-1)">上一张</button>
-            <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ files.rows.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
-            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex < 0 || currentFileIndex >= files.rows.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
+            <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ filteredFiles.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
+            <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex >= filteredFiles.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
             <button class="btn ghost compact-btn" type="button" title="快捷键 (?)" @click="annotate.showShortcutHelp = !annotate.showShortcutHelp">快捷键</button>
             <button class="btn danger compact-btn" type="button" :disabled="loading || !annotate.current" @click="deleteCurrentAnnotateFile">删除图片</button>
           </div>
@@ -294,7 +324,7 @@
             <div v-if="!annotate.labels.length" class="empty-note">添加标签后即可运行 AI 并分配类别。</div>
             <div class="label-chip-list">
               <div v-for="label in annotate.labels" :key="label" class="label-chip-row">
-                <button type="button" class="label-chip" :style="labelChipStyle(label)" @click="applyLabelToActive(label)">
+                <button type="button" class="label-chip" :style="labelChipStyle(label)" :title="'设置为 ' + label + '（数字键 ' + (annotate.labels.indexOf(label) + 1) + '）'" @click="applyLabelToActive(label)">
                   <i class="label-color-swatch" :style="labelSwatchStyle(label)" />
                   {{ label }}
                 </button>
@@ -315,7 +345,34 @@
                 >
                   删除
                 </button>
+                <input
+                  v-if="effectiveAiMode === 'concepts'"
+                  class="label-prompt-input"
+                  :value="annotate.labelPrompts[label] || ''"
+                  :placeholder="'英文提示词，默认 ' + label"
+                  :title="'SAM 3 识别「' + label + '」时使用的英文描述'"
+                  @change="saveLabelPrompt(label, $event.target.value)"
+                />
               </div>
+            </div>
+          </div>
+
+          <div class="label-manager-inline model-manager">
+            <h2>自定义模型</h2>
+            <p class="model-hint">上传 ONNX 格式的 YOLO 模型做预标注（<code>yolo export model=best.pt format=onnx</code>）。模型类别名与项目标签同名的会自动对应。</p>
+            <div class="settings-inline-form yolo-label-form">
+              <input v-model="annotate.modelUpload.name" placeholder="模型名称（可选）" :disabled="annotate.modelUpload.busy" />
+              <label :class="['btn compact-btn upload-inline', { disabled: annotate.modelUpload.busy || !projects.selectedId }]">
+                <input type="file" accept=".onnx" :disabled="annotate.modelUpload.busy || !projects.selectedId" @change="uploadModel($event.target.files); $event.target.value = ''" />
+                <span>{{ annotate.modelUpload.busy ? '上传中…' : '上传 .onnx' }}</span>
+              </label>
+            </div>
+            <div v-for="model in annotate.models" :key="model.id" class="model-row">
+              <div>
+                <strong>{{ model.name }}</strong>
+                <small>{{ formatBytes(model.size) }} · {{ model.classNames ? '类别：' + model.classNames.join('、') : '首次使用后显示类别' }}</small>
+              </div>
+              <button class="label-delete-btn" type="button" @click="deleteModel(model)">删除</button>
             </div>
           </div>
 
@@ -374,6 +431,15 @@ const onCanvasDoubleClick = inject("onCanvasDoubleClick");
 const onCanvasWheel = inject("onCanvasWheel");
 const undoAnnotationEdit = inject("undoAnnotationEdit");
 const redoAnnotationEdit = inject("redoAnnotationEdit");
+const effectiveAiMode = inject("effectiveAiMode");
+const aiModeValue = inject("aiModeValue");
+const setAiMode = inject("setAiMode");
+const labelsNeedingPrompt = inject("labelsNeedingPrompt");
+const saveLabelPrompt = inject("saveLabelPrompt");
+const uploadModel = inject("uploadModel");
+const deleteModel = inject("deleteModel");
+const batchActive = inject("batchActive");
+const cancelBatch = inject("cancelBatch");
 const toggleManualDrawMode = inject("toggleManualDrawMode");
 const togglePointPromptMode = inject("togglePointPromptMode");
 const setAnnotatePointPolarity = inject("setAnnotatePointPolarity");

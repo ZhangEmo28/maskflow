@@ -65,7 +65,9 @@ public static class StateDiff
         TeamMembers = [.. state.TeamMembers],
         Devices = [.. state.Devices],
         Exports = [.. state.Exports],
+        AiModels = [.. state.AiModels],
         ProjectLabels = new(state.ProjectLabels),
+        ProjectLabelPrompts = new(state.ProjectLabelPrompts),
         Quotas = new(state.Quotas),
         NotificationSettings = new(state.NotificationSettings)
     };

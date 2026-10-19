@@ -22,7 +22,10 @@ public record MaskFlowState
     public List<TeamMember> TeamMembers { get; set; } = [];
     public List<AccountDevice> Devices { get; set; } = [];
     public List<DatasetExport> Exports { get; set; } = [];
+    public List<AiModel> AiModels { get; set; } = [];
     public Dictionary<string, List<string>> ProjectLabels { get; set; } = [];
+    // projectId -> label -> SAM 3 text prompt (labels without an entry use the label itself)
+    public Dictionary<string, Dictionary<string, string>> ProjectLabelPrompts { get; set; } = [];
     public Dictionary<string, AiQuota> Quotas { get; set; } = [];
     public Dictionary<string, NotificationSettings> NotificationSettings { get; set; } = [];
 }
@@ -41,7 +44,10 @@ public record ProjectCopyRequest(string? Name);
 public record ProjectLabelsRequest(List<string> Labels);
 public record TaskCreate(string Type, string? Title, string? ProjectId, int? FileId, int ImageCount = 1);
 public record ExportRequest(string? ProjectId, string? TaskId, SplitConfig? Split, string Format = "yolo", int Seed = 42);
-public record AnnotationAutoRequest(int FileId, double Conf = 0.25, string? DefaultLabel = null);
+public record AnnotationAutoRequest(int FileId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null);
+public record AnnotationBatchRequest(string ProjectId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null, string Scope = "unannotated");
+public record LabelPromptsRequest(Dictionary<string, string?> Prompts);
+public record AiModel(string Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Sha256, List<string>? ClassNames, DateTimeOffset CreatedAt);
 public record AnnotationPointsRequest(int FileId, List<double[]> Points, List<int> Labels, double Conf = 0.25);
 public record AnnotationSaveRequest(int FileId, int Width, int Height, List<AnnotationItem> Annotations);
 public record JobCreate(string Type, int UserId, string? ProjectId, Dictionary<string, object?> Input, Dictionary<string, object?> Params);

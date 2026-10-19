@@ -25,6 +25,13 @@ public sealed class SamInferenceGate
         return new SlotLease(slots);
     }
 
+    // Background work waits for a slot instead of failing; interactive requests use TryAcquireAsync.
+    public async Task<IAsyncDisposable> WaitAsync(CancellationToken cancellationToken = default)
+    {
+        await slots.WaitAsync(cancellationToken);
+        return new SlotLease(slots);
+    }
+
     sealed class SlotLease(SemaphoreSlim semaphore) : IAsyncDisposable
     {
         int released;

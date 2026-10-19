@@ -68,6 +68,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m compileall -q app
+      - run: pip install -r requirements-test.txt
+      - run: python -m pytest -q tests
 
   compose:
     name: Compose validation
