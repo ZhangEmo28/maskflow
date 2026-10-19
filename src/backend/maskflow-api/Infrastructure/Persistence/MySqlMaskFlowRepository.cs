@@ -64,6 +64,9 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         await LoadProjectLabelsAsync(connection, state);
         await LoadLabelPromptsAsync(connection, state);
         await LoadAiModelsAsync(connection, state);
+        await LoadProjectMembersAsync(connection, state);
+        await LoadProjectInvitesAsync(connection, state);
+        await LoadFileAssignmentsAsync(connection, state);
         await LoadFilesAsync(connection, state);
         await LoadAnnotationSetsAsync(connection, state);
         await LoadTasksAsync(connection, state);
@@ -133,9 +136,26 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
                 x => [x.Id, x.UserId, x.ProjectId, x.Name, x.Path, x.Size, x.Kind, x.ContentType, x.CreatedAt, x.DownloadUrl, x.Phash]);
 
             await ApplyAsync(connection, tx, "annotation_sets", "id",
-                ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at"],
+                ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at",
+                 "review_status", "review_comment", "reviewed_by", "reviewed_at", "submitted_by"],
                 before.AnnotationSets, current.AnnotationSets, x => x.Id,
-                x => [x.Id, x.UserId, x.FileId, x.Width, x.Height, Json(x.Annotations), x.YoloTxt, x.CreatedAt, x.UpdatedAt]);
+                x => [x.Id, x.UserId, x.FileId, x.Width, x.Height, Json(x.Annotations), x.YoloTxt, x.CreatedAt, x.UpdatedAt,
+                      x.ReviewStatus, x.ReviewComment, x.ReviewedBy, x.ReviewedAt, x.SubmittedBy]);
+
+            await ApplyAsync(connection, tx, "project_members", "id",
+                ["id", "project_id", "user_id", "role", "invited_by", "created_at"],
+                before.ProjectMembers, current.ProjectMembers, x => x.Id,
+                x => [x.Id, x.ProjectId, x.UserId, x.Role, x.InvitedBy, x.CreatedAt]);
+
+            await ApplyAsync(connection, tx, "project_invites", "id",
+                ["id", "project_id", "email", "role", "token_hash", "invited_by", "created_at", "expires_at"],
+                before.ProjectInvites, current.ProjectInvites, x => x.Id,
+                x => [x.Id, x.ProjectId, x.Email, x.Role, x.TokenHash, x.InvitedBy, x.CreatedAt, x.ExpiresAt]);
+
+            await ApplyAsync(connection, tx, "file_assignments", "file_id",
+                ["file_id", "user_id", "assigned_by", "assigned_at"],
+                before.FileAssignments, current.FileAssignments, x => x.FileId,
+                x => [x.FileId, x.UserId, x.AssignedBy, x.AssignedAt]);
 
             await ApplyAsync(connection, tx, "tasks", "id",
                 ["id", "user_id", "job_id", "type", "title", "project_id", "file_id", "image_count", "status", "progress", "result_json", "error_message", "created_at", "started_at", "finished_at"],
@@ -287,7 +307,17 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         s.Files.Add(new FileItem(I(r, "id"), I(r, "user_id"), N(r, "project_id"), S(r, "name"), S(r, "object_path"), L(r, "size_bytes"), S(r, "kind"), N(r, "content_type"), D(r, "created_at"), S(r, "download_url"), N(r, "phash"))));
 
     async Task LoadAnnotationSetsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM annotation_sets", r =>
-        s.AnnotationSets.Add(new AnnotationSet(S(r, "id"), I(r, "user_id"), I(r, "file_id"), I(r, "width"), I(r, "height"), FromJson<List<AnnotationItem>>(S(r, "annotations_json")) ?? [], S(r, "yolo_txt"), D(r, "created_at"), D(r, "updated_at"))));
+        s.AnnotationSets.Add(new AnnotationSet(S(r, "id"), I(r, "user_id"), I(r, "file_id"), I(r, "width"), I(r, "height"), FromJson<List<AnnotationItem>>(S(r, "annotations_json")) ?? [], S(r, "yolo_txt"), D(r, "created_at"), D(r, "updated_at"),
+            N(r, "review_status") ?? "draft", N(r, "review_comment"), NI(r, "reviewed_by"), ND(r, "reviewed_at"), NI(r, "submitted_by"))));
+
+    async Task LoadProjectMembersAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM project_members", r =>
+        s.ProjectMembers.Add(new ProjectMember(S(r, "id"), S(r, "project_id"), I(r, "user_id"), S(r, "role"), I(r, "invited_by"), D(r, "created_at"))));
+
+    async Task LoadProjectInvitesAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM project_invites", r =>
+        s.ProjectInvites.Add(new ProjectInvite(S(r, "id"), S(r, "project_id"), S(r, "email"), S(r, "role"), S(r, "token_hash"), I(r, "invited_by"), D(r, "created_at"), D(r, "expires_at"))));
+
+    async Task LoadFileAssignmentsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM file_assignments", r =>
+        s.FileAssignments.Add(new FileAssignment(I(r, "file_id"), I(r, "user_id"), I(r, "assigned_by"), D(r, "assigned_at"))));
 
     async Task LoadTasksAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM tasks", r =>
         s.Tasks.Add(new TaskItem(S(r, "id"), I(r, "user_id"), S(r, "job_id"), S(r, "type"), N(r, "title"), N(r, "project_id"), NI(r, "file_id"), I(r, "image_count"), S(r, "status"), Db(r, "progress"), FromJson<Dictionary<string, object?>>(N(r, "result_json")), N(r, "error_message"), D(r, "created_at"), ND(r, "started_at"), ND(r, "finished_at"))));
@@ -748,7 +778,44 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
           updated_at DATETIME(6) NOT NULL
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """,
+        """
+        CREATE TABLE IF NOT EXISTS project_members (
+          id VARCHAR(100) PRIMARY KEY,
+          project_id VARCHAR(64) NOT NULL,
+          user_id INT NOT NULL,
+          role VARCHAR(20) NOT NULL,
+          invited_by INT NOT NULL,
+          created_at DATETIME(6) NOT NULL,
+          INDEX ix_project_members_user (user_id)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS project_invites (
+          id VARCHAR(64) PRIMARY KEY,
+          project_id VARCHAR(64) NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          role VARCHAR(20) NOT NULL,
+          token_hash CHAR(64) NOT NULL,
+          invited_by INT NOT NULL,
+          created_at DATETIME(6) NOT NULL,
+          expires_at DATETIME(6) NOT NULL
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS file_assignments (
+          file_id INT PRIMARY KEY,
+          user_id INT NOT NULL,
+          assigned_by INT NOT NULL,
+          assigned_at DATETIME(6) NOT NULL,
+          INDEX ix_file_assignments_user (user_id)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """,
         // Column additions go last so their tables exist on a fresh database.
-        "ALTER TABLE files ADD COLUMN phash CHAR(16) NULL"
+        "ALTER TABLE files ADD COLUMN phash CHAR(16) NULL",
+        "ALTER TABLE annotation_sets ADD COLUMN review_status VARCHAR(20) NOT NULL DEFAULT 'draft'",
+        "ALTER TABLE annotation_sets ADD COLUMN review_comment VARCHAR(1000) NULL",
+        "ALTER TABLE annotation_sets ADD COLUMN reviewed_by INT NULL",
+        "ALTER TABLE annotation_sets ADD COLUMN reviewed_at DATETIME(6) NULL",
+        "ALTER TABLE annotation_sets ADD COLUMN submitted_by INT NULL"
     ];
 }

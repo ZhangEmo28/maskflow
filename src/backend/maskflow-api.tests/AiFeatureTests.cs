@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MaskFlow.Api.Tests;
 
-sealed class FakeEmailSender : IEmailSender
+public sealed class FakeEmailSender : IEmailSender
 {
     public bool IsConfigured => true;
     public List<(string To, string Subject, string Body)> Sent { get; } = [];

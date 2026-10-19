@@ -26,12 +26,13 @@ public sealed class AnnotationController : ControllerBase
     public async Task<IActionResult> Auto([FromBody] AnnotationAutoRequest request)
     {
         var user = store.RequireUser(HttpContext);
-        store.EnsureAiQuotaAvailable(user);
-        var file = store.State.Files.FirstOrDefault(x => x.Id == request.FileId && x.UserId == user.Id);
-        if (file is null || !await store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
+        var (file, ownerId, _) = store.RequireFileAccess(user.Id, request.FileId, Permissions.Edit);
+        // AI usage is billed to the project owner, whose data it is.
+        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
+        if (!await store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
 
         var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
-        annotator.Validate(user.Id, file, options);
+        annotator.Validate(ownerId, file, options);
         await using var slot = await samGate.TryAcquireAsync(HttpContext.RequestAborted);
         if (slot is null)
         {
@@ -40,7 +41,7 @@ public sealed class AnnotationController : ControllerBase
 
         try
         {
-            var set = await annotator.RunAsync(user.Id, file, options, recordTask: true, HttpContext.RequestAborted);
+            var set = await annotator.RunAsync(ownerId, file, options, recordTask: true, HttpContext.RequestAborted);
             return Ok(new { annotation = set, user = store.PublicUser(store.GetUser(user.Id)!) });
         }
         catch (SamServiceException ex)
@@ -62,29 +63,30 @@ public sealed class AnnotationController : ControllerBase
     public async Task<IActionResult> Batch([FromBody] AnnotationBatchRequest request)
     {
         var user = store.RequireUser(HttpContext);
-        store.EnsureAiQuotaAvailable(user);
-        var project = store.State.Projects.FirstOrDefault(x => x.Id == request.ProjectId && x.UserId == user.Id);
-        if (project is null) return NotFound(new { detail = "Project not found." });
+        var access = store.RequireProjectAccess(user.Id, request.ProjectId, Permissions.Edit);
+        var ownerId = access.OwnerId;
+        var project = access.Project;
+        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
 
         var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
         var files = store.State.Files
-            .Where(x => x.UserId == user.Id && x.ProjectId == project.Id && x.Kind == "image")
+            .Where(x => x.UserId == ownerId && x.ProjectId == project.Id && x.Kind == "image")
             .OrderBy(x => x.Id)
             .ToList();
         if (files.Count == 0) return BadRequest(new { detail = "项目中还没有图片。" });
-        annotator.Validate(user.Id, files[0], options);
+        annotator.Validate(ownerId, files[0], options);
 
-        var annotated = store.State.AnnotationSets.Where(x => x.UserId == user.Id).Select(x => x.FileId).ToHashSet();
+        var annotated = store.State.AnnotationSets.Where(x => x.UserId == ownerId).Select(x => x.FileId).ToHashSet();
         var fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id)))
             .Select(x => x.Id)
             .ToList();
         if (fileIds.Count == 0) return BadRequest(new { detail = "没有需要处理的图片：所有图片都已有标注。" });
 
-        var active = store.State.Tasks.Any(x => x.UserId == user.Id && x.ProjectId == project.Id
+        var active = store.State.Tasks.Any(x => x.UserId == ownerId && x.ProjectId == project.Id
             && x.Type == MaskFlowStore.BatchAnnotationTaskType && x.Status is "queued" or "running");
         if (active) return Conflict(new { detail = "该项目已有正在进行的批量标注任务。" });
 
-        var task = await store.CreateBatchAnnotationTaskAsync(user.Id, request with { Mode = options.Mode }, fileIds);
+        var task = await store.CreateBatchAnnotationTaskAsync(ownerId, request with { Mode = options.Mode }, fileIds);
         worker.Wake();
         return Ok(new { task });
     }
@@ -93,14 +95,8 @@ public sealed class AnnotationController : ControllerBase
     public async Task<IActionResult> Points([FromBody] AnnotationPointsRequest request)
     {
         var user = store.RequireUser(HttpContext);
-        try
-        {
-            store.EnsureAiQuotaAvailable(user);
-        }
-        catch (BadHttpRequestException ex)
-        {
-            return StatusCode(ex.StatusCode, new { detail = ex.Message });
-        }
+        var (file, ownerId, _) = store.RequireFileAccess(user.Id, request.FileId, Permissions.Edit);
+        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
 
         if (request.Points is null || request.Points.Count == 0)
         {
@@ -117,8 +113,7 @@ public sealed class AnnotationController : ControllerBase
             return BadRequest(new { detail = "At least one positive point (label=1) is required." });
         }
 
-        var file = store.State.Files.FirstOrDefault(x => x.Id == request.FileId && x.UserId == user.Id);
-        if (file is null || !await store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
+        if (!await store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
 
         await using var slot = await samGate.TryAcquireAsync(HttpContext.RequestAborted);
         if (slot is null)
@@ -142,7 +137,7 @@ public sealed class AnnotationController : ControllerBase
             var body = await response.Content.ReadAsStringAsync(HttpContext.RequestAborted);
             if (response.IsSuccessStatusCode)
             {
-                await store.ConsumeAiQuotaAsync(user.Id, 1);
+                await store.ConsumeAiQuotaAsync(ownerId, 1);
             }
 
             return new ContentResult
@@ -166,7 +161,8 @@ public sealed class AnnotationController : ControllerBase
     public IActionResult GetByFile(int fileId)
     {
         var user = store.RequireUser(HttpContext);
-        var set = store.GetAnnotationSet(user.Id, fileId);
+        var (_, ownerId, _) = store.RequireFileAccess(user.Id, fileId, Permissions.Read);
+        var set = store.GetAnnotationSet(ownerId, fileId);
         return set is null ? NotFound(new { detail = "Annotation not found." }) : Ok(new { annotation = set });
     }
 
@@ -174,7 +170,8 @@ public sealed class AnnotationController : ControllerBase
     public async Task<IActionResult> SaveByFile(int fileId, [FromBody] AnnotationSaveRequest request)
     {
         var user = store.RequireUser(HttpContext);
-        var set = await store.SaveAnnotationSetAsync(user.Id, request with { FileId = fileId });
+        var (_, ownerId, access) = store.RequireFileAccess(user.Id, fileId, Permissions.Edit);
+        var set = await store.SaveAnnotationSetAsync(ownerId, request with { FileId = fileId }, access?.Role ?? "owner");
         return Ok(new { annotation = set });
     }
 
@@ -182,10 +179,21 @@ public sealed class AnnotationController : ControllerBase
     public async Task<IActionResult> DeleteItem(int fileId, string annotationId)
     {
         var user = store.RequireUser(HttpContext);
-        var set = store.GetAnnotationSet(user.Id, fileId);
+        var (_, ownerId, access) = store.RequireFileAccess(user.Id, fileId, Permissions.Edit);
+        var set = store.GetAnnotationSet(ownerId, fileId);
         if (set is null) return NotFound(new { detail = "Annotation not found." });
-        var next = await store.SaveAnnotationSetAsync(user.Id, new AnnotationSaveRequest(fileId, set.Width, set.Height, set.Annotations.Where(x => x.Id != annotationId).ToList()));
+        var next = await store.SaveAnnotationSetAsync(ownerId, new AnnotationSaveRequest(fileId, set.Width, set.Height, set.Annotations.Where(x => x.Id != annotationId).ToList()), access?.Role ?? "owner");
         return Ok(new { annotation = next });
+    }
+
+    // Review workflow: annotators submit, reviewers approve (confirms labelled targets) or reject with a reason.
+    [HttpPost("/api/annotations/file/{fileId:int}/{step:regex(^(submit|approve|reject)$)}")]
+    public async Task<IActionResult> Review(int fileId, string step, [FromBody] ReviewRequest? request)
+    {
+        var user = store.RequireUser(HttpContext);
+        var (_, ownerId, _) = store.RequireFileAccess(user.Id, fileId, step == "submit" ? Permissions.Edit : Permissions.Review);
+        var set = await store.ReviewAnnotationAsync(user.Id, ownerId, fileId, step, request?.Comment);
+        return Ok(new { annotation = set });
     }
 
     [HttpPost("/api/annotation/masks")]

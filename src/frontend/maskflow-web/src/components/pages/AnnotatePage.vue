@@ -20,16 +20,21 @@
         </div>
         <select :value="projects.selectedId" @change="selectProject($event.target.value)">
           <option value="">选择项目</option>
-          <option v-for="project in projects.rows" :key="project.id" :value="project.id">{{ project.name }} · {{ project.imageCount || 0 }} 张</option>
+          <option v-for="project in projects.rows" :key="project.id" :value="project.id">{{ project.name }} · {{ project.imageCount || 0 }} 张{{ project.role && project.role !== 'owner' ? ' · 共享（' + roleLabels[project.role] + '）' : '' }}</option>
         </select>
+        <button class="btn secondary compact-btn" type="button" :disabled="!projects.selectedId" @click="openTeamPanel">
+          团队{{ selectedProject?.memberCount ? ' · ' + (selectedProject.memberCount + 1) + ' 人' : '' }}
+        </button>
         <input v-model="projects.newName" placeholder="新项目名称，例如 道路场景" @keyup.enter="createProject" />
         <select v-model="projects.newDataType" class="project-type-select" title="新建项目的任务类型">
           <option value="detection">目标检测</option>
           <option value="segmentation">实例分割</option>
         </select>
         <button class="btn compact-btn" type="button" @click="createProject">新建项目</button>
-        <button class="btn secondary compact-btn" type="button" :disabled="loading || !projects.selectedId" @click="copyCurrentProject">复制项目</button>
+        <button class="btn secondary compact-btn" type="button" :disabled="loading || !projects.selectedId || !canManageProject" @click="copyCurrentProject">复制项目</button>
       </section>
+      <TeamPanel v-if="team.open" />
+      <p v-if="projects.selectedId && !canEditProject" class="annotate-label-hint">你在这个项目里是只读成员，可以查看图片和标注，不能修改。</p>
 
       <section class="annotate-topbar">
         <label class="upload-inline">
@@ -58,10 +63,10 @@
             {{ label }}
           </span>
         </div>
-        <button class="btn" :disabled="loading || !annotate.ready || !canRunAnnotateAi" @click="runCurrentMask">运行当前图片</button>
-        <button class="btn secondary" :disabled="loading || batchActive || !files.rows.length || !canRunAnnotateAi" title="在服务器后台处理，默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
-        <button class="btn secondary" :disabled="loading || !annotate.ready || (!annotate.dirty && !annotationStats.pending)" @click="saveAnnotation">保存</button>
-        <button class="btn ghost" :disabled="!projects.selectedId || !annotate.labels.length" @click="createExport">导出 ZIP</button>
+        <button class="btn" :disabled="loading || !annotate.ready || !canRunAnnotateAi || !canEditProject" @click="runCurrentMask">运行当前图片</button>
+        <button class="btn secondary" :disabled="loading || batchActive || !files.rows.length || !canRunAnnotateAi || !canEditProject" title="在服务器后台处理，默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
+        <button class="btn secondary" :disabled="loading || !annotate.ready || !canEditProject || (!annotate.dirty && !(canReviewProject && annotationStats.pending))" @click="saveAnnotation">保存</button>
+        <button class="btn ghost" :disabled="!projects.selectedId || !annotate.labels.length || !canReviewProject" :title="canReviewProject ? '' : '导出需要审核员或所有者权限'" @click="createExport">导出 ZIP</button>
       </section>
 
       <p v-if="!annotate.labels.length" class="annotate-label-hint">请先添加至少一个项目标签，再运行 AI 自动标注。</p>
@@ -91,6 +96,14 @@
             <button type="button" :class="{ active: annotate.filter === 'annotated' }" @click="annotate.filter = 'annotated'">已标注</button>
             <button type="button" :class="{ active: annotate.filter === 'review' }" @click="annotate.filter = 'review'">待复核</button>
           </div>
+          <select v-if="isSharedProject" v-model="annotate.reviewQueue" class="queue-sort" aria-label="审核筛选">
+            <option value="all">全部审核状态</option>
+            <option value="mine">分配给我的</option>
+            <option value="submitted">待审核</option>
+            <option value="rejected">已驳回</option>
+            <option value="approved">已通过</option>
+            <option value="draft">未提交</option>
+          </select>
           <select v-model="annotate.queueSort" class="queue-sort" aria-label="图片排序">
             <option value="default">默认顺序</option>
             <option value="uncertain">低置信度优先（先复核最不确定的）</option>
@@ -101,8 +114,10 @@
               <small>
                 {{ formatBytes(file.size) }} · {{ file.annotated ? file.annotationCount + ' 条标注' : '未标注' }}
                 <template v-if="file.unconfirmedCount"> · {{ file.unconfirmedCount }} 待复核 · 最低 {{ Number(file.minConfidence).toFixed(2) }}</template>
+                <template v-if="isSharedProject && file.reviewStatus && file.reviewStatus !== 'draft'"> · <em :class="['review-badge', file.reviewStatus]">{{ reviewLabels[file.reviewStatus] }}</em></template>
+                <template v-if="file.assignedToEmail"> · 分配给 {{ file.assignedTo === account?.id ? '我' : file.assignedToEmail }}</template>
               </small>
-              <i class="queue-delete-btn" title="删除图片" @click.stop="deleteAnnotateFile(file)">删除</i>
+              <i v-if="canReviewProject" class="queue-delete-btn" title="删除图片" @click.stop="deleteAnnotateFile(file)">删除</i>
               <b :class="['file-status-dot', { done: file.annotated }]" title="已执行自动标注"></b>
             </button>
             <div v-if="!filteredFiles.length" class="empty-note">当前筛选下没有图片。</div>
@@ -131,7 +146,7 @@
             <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ filteredFiles.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
             <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex >= filteredFiles.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
             <button class="btn ghost compact-btn" type="button" title="快捷键 (?)" @click="annotate.showShortcutHelp = !annotate.showShortcutHelp">快捷键</button>
-            <button class="btn danger compact-btn" type="button" :disabled="loading || !annotate.current" @click="deleteCurrentAnnotateFile">删除图片</button>
+            <button v-if="canReviewProject" class="btn danger compact-btn" type="button" :disabled="loading || !annotate.current" @click="deleteCurrentAnnotateFile">删除图片</button>
           </div>
           <div v-if="annotate.current" class="yolo-canvas">
             <div
@@ -248,9 +263,22 @@
               <button :class="['btn compact-btn', annotate.reviewFilterOpen ? 'active-tool' : 'secondary']" type="button" :disabled="!annotate.annotations.length" @click="toggleReviewFilterPanel">
                 {{ annotate.reviewFilterOpen ? '收起筛选' : '筛选' }}
               </button>
-              <button class="btn compact-btn" type="button" :disabled="loading || !annotate.ready || !annotate.annotations.length" @click="saveAnnotation">保存</button>
+              <button class="btn compact-btn" type="button" :disabled="loading || !annotate.ready || !annotate.annotations.length || !canEditProject" @click="saveAnnotation">保存</button>
             </div>
           </div>
+          <section v-if="isSharedProject && annotate.current" :class="['review-status-card', annotate.review.status]">
+            <div>
+              <strong>审核：{{ reviewLabels[annotate.review.status] }}</strong>
+              <p v-if="annotate.review.comment">{{ annotate.review.status === 'rejected' ? '驳回原因：' : '备注：' }}{{ annotate.review.comment }}</p>
+            </div>
+            <div class="review-actions">
+              <button v-if="canEditProject && !canReviewProject" class="btn compact-btn" type="button" :disabled="loading || !annotate.ready || annotate.review.status === 'submitted' || annotate.review.status === 'approved'" @click="reviewCurrent('submit')">提交审核</button>
+              <template v-if="canReviewProject">
+                <button class="btn compact-btn" type="button" :disabled="loading || !annotate.ready || annotate.review.status === 'approved'" @click="reviewCurrent('approve')">通过</button>
+                <button class="btn secondary compact-btn" type="button" :disabled="loading || !annotate.ready" @click="reviewCurrent('reject')">驳回</button>
+              </template>
+            </div>
+          </section>
           <section v-if="annotate.reviewFilterOpen" class="review-filter-panel">
             <div class="review-filter-head">
               <div>
@@ -317,7 +345,7 @@
 
           <div class="label-manager-inline">
             <h2>标签</h2>
-            <div class="settings-inline-form yolo-label-form">
+            <div v-if="canReviewProject" class="settings-inline-form yolo-label-form">
               <input v-model="annotate.newLabel" placeholder="新增标签，例如 person" @keyup.enter="addAnnotateLabel" />
               <button class="btn compact-btn" type="button" @click="addAnnotateLabel">新增</button>
             </div>
@@ -337,7 +365,7 @@
                   <button class="btn secondary compact-btn" type="button" @click="cancelDeleteAnnotateLabel">取消</button>
                 </template>
                 <button
-                  v-else
+                  v-else-if="canReviewProject"
                   class="label-delete-btn"
                   type="button"
                   :disabled="loading"
@@ -346,7 +374,7 @@
                   删除
                 </button>
                 <input
-                  v-if="effectiveAiMode === 'concepts'"
+                  v-if="effectiveAiMode === 'concepts' && canReviewProject"
                   class="label-prompt-input"
                   :value="annotate.labelPrompts[label] || ''"
                   :placeholder="'英文提示词，默认 ' + label"
@@ -357,7 +385,7 @@
             </div>
           </div>
 
-          <div class="label-manager-inline model-manager">
+          <div v-if="canReviewProject" class="label-manager-inline model-manager">
             <h2>自定义模型</h2>
             <p class="model-hint">上传 ONNX 格式的 YOLO 模型做预标注（<code>yolo export model=best.pt format=onnx</code>）。模型类别名与项目标签同名的会自动对应。</p>
             <div class="settings-inline-form yolo-label-form">
@@ -395,6 +423,7 @@
 
 <script setup>
 import { inject } from "vue";
+import TeamPanel from "../TeamPanel.vue";
 import { HANDLES, handleCursor } from "../../lib/boxEditing";
 import { SHORTCUT_HELP } from "../../lib/shortcuts";
 
@@ -440,6 +469,16 @@ const uploadModel = inject("uploadModel");
 const deleteModel = inject("deleteModel");
 const batchActive = inject("batchActive");
 const cancelBatch = inject("cancelBatch");
+const team = inject("team");
+const account = inject("account");
+const canEditProject = inject("canEditProject");
+const canReviewProject = inject("canReviewProject");
+const canManageProject = inject("canManageProject");
+const isSharedProject = inject("isSharedProject");
+const roleLabels = inject("roleLabels");
+const reviewLabels = inject("reviewLabels");
+const openTeamPanel = inject("openTeamPanel");
+const reviewCurrent = inject("reviewCurrent");
 const toggleManualDrawMode = inject("toggleManualDrawMode");
 const togglePointPromptMode = inject("togglePointPromptMode");
 const setAnnotatePointPolarity = inject("setAnnotatePointPolarity");

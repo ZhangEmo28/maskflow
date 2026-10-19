@@ -7,16 +7,23 @@ public sealed class FilesController : MaskFlowControllerBase
 {
     public FilesController(MaskFlowStore store) : base(store) { }
 
+    // Uploads into a shared project are stored under (and counted against) the project owner.
     [HttpPost("upload")]
     public async Task<IActionResult> Upload()
     {
         var user = CurrentUser();
         var form = await Request.ReadFormAsync();
         var projectId = form["projectId"].FirstOrDefault();
+        var owner = user;
+        if (!string.IsNullOrWhiteSpace(projectId))
+        {
+            owner = Store.GetUser(Store.RequireProjectAccess(user.Id, projectId, Permissions.Edit).OwnerId)!;
+        }
+
         var files = new List<FileItem>();
         foreach (var upload in form.Files)
         {
-            files.Add(await Store.SaveUploadAsync(user, upload, projectId));
+            files.Add(await Store.SaveUploadAsync(owner, upload, projectId));
         }
 
         return Ok(new { files, user = Store.PublicUser(Store.GetUser(user.Id)!) });
@@ -26,13 +33,26 @@ public sealed class FilesController : MaskFlowControllerBase
     public IActionResult List([FromQuery] string? projectId)
     {
         var user = CurrentUser();
-        var files = Store.State.Files
-            .Where(x => x.UserId == user.Id && (string.IsNullOrWhiteSpace(projectId) || x.ProjectId == projectId))
+        var ownerId = user.Id;
+        IEnumerable<FileItem> source;
+        if (!string.IsNullOrWhiteSpace(projectId))
+        {
+            ownerId = Store.RequireProjectAccess(user.Id, projectId, Permissions.Read).OwnerId;
+            source = Store.State.Files.Where(x => x.ProjectId == projectId);
+        }
+        else
+        {
+            source = Store.State.Files.Where(x => x.UserId == user.Id);
+        }
+
+        var assignments = Store.State.FileAssignments.ToDictionary(x => x.FileId, x => x.UserId);
+        var files = source
             .OrderByDescending(x => x.CreatedAt)
             .Select(file =>
             {
-                var set = Store.GetAnnotationSet(user.Id, file.Id);
+                var set = Store.GetAnnotationSet(ownerId, file.Id);
                 var unconfirmed = set?.Annotations.Where(x => !x.Confirmed).ToList() ?? [];
+                var assignedTo = assignments.TryGetValue(file.Id, out var assignee) ? assignee : (int?)null;
                 return new
                 {
                     file.Id,
@@ -48,7 +68,11 @@ public sealed class FilesController : MaskFlowControllerBase
                     AnnotationCount = set?.Annotations.Count ?? 0,
                     // Review queue ordering: images whose least certain unreviewed target is lowest come first.
                     UnconfirmedCount = unconfirmed.Count,
-                    MinConfidence = unconfirmed.Count == 0 ? (double?)null : unconfirmed.Min(x => x.Confidence)
+                    MinConfidence = unconfirmed.Count == 0 ? (double?)null : unconfirmed.Min(x => x.Confidence),
+                    ReviewStatus = set?.ReviewStatus,
+                    ReviewComment = set?.ReviewComment,
+                    AssignedTo = assignedTo,
+                    AssignedToEmail = assignedTo is null ? null : Store.GetUser(assignedTo.Value)?.Email
                 };
             });
         return Ok(new { files, user = Store.PublicUser(Store.GetUser(user.Id)!) });
@@ -58,8 +82,8 @@ public sealed class FilesController : MaskFlowControllerBase
     public async Task<IActionResult> Download(int fileId)
     {
         var user = CurrentUser();
-        var file = Store.State.Files.FirstOrDefault(x => x.Id == fileId && x.UserId == user.Id);
-        if (file is null || !await Store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
+        var (file, _, _) = Store.RequireFileAccess(user.Id, fileId, Permissions.Read);
+        if (!await Store.StoredObjectExistsAsync(file.Path)) return NotFound(new { detail = "File not found." });
         var provider = new FileExtensionContentTypeProvider();
         provider.TryGetContentType(file.Name, out var contentType);
         return File(await Store.OpenStoredObjectAsync(file.Path), contentType ?? "application/octet-stream", file.Name);
@@ -69,7 +93,8 @@ public sealed class FilesController : MaskFlowControllerBase
     public async Task<IActionResult> Delete(int fileId)
     {
         var user = CurrentUser();
-        var deleted = await Store.DeleteFileAsync(user.Id, fileId);
+        var (_, ownerId, _) = Store.RequireFileAccess(user.Id, fileId, Permissions.Review);
+        var deleted = await Store.DeleteFileAsync(ownerId, fileId);
         return deleted ? Ok(new { ok = true, user = Store.PublicUser(Store.GetUser(user.Id)!) }) : NotFound(new { detail = "File not found." });
     }
 }

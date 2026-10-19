@@ -15,7 +15,7 @@ public static class Util
     public static string Sha256(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 }
 
-public sealed class MaskFlowStore
+public sealed partial class MaskFlowStore
 {
     readonly SemaphoreSlim gate = new(1, 1);
     readonly IMaskFlowRepository repository;
@@ -877,6 +877,8 @@ public sealed class MaskFlowStore
             State.Exports.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
             State.ProjectLabels.Remove(projectId);
             State.ProjectLabelPrompts.Remove(projectId);
+            State.ProjectMembers.RemoveAll(x => x.ProjectId == projectId);
+            State.ProjectInvites.RemoveAll(x => x.ProjectId == projectId);
             State.Projects.Remove(project);
             deleted = true;
         });
@@ -896,6 +898,7 @@ public sealed class MaskFlowStore
         if (file is null) return false;
         State.Files.Remove(file);
         State.AnnotationSets.RemoveAll(x => x.FileId == fileId && x.UserId == userId);
+        State.FileAssignments.RemoveAll(x => x.FileId == fileId);
         deleteAfterCommit.Add(file.Path);
 
         var user = GetUser(userId);
@@ -907,14 +910,18 @@ public sealed class MaskFlowStore
         return true;
     }
 
-    public async Task<AnnotationSet> SaveAnnotationSetAsync(int userId, AnnotationSaveRequest request)
+    // userId is the data owner. Annotators never confirm their own work: their saves clear
+    // confirmations and send the image back to "draft" until a reviewer approves it.
+    public async Task<AnnotationSet> SaveAnnotationSetAsync(int userId, AnnotationSaveRequest request, string role = "owner")
     {
         AnnotationSet? set = null;
-        await SaveAsync(() => set = ApplyAnnotationSet(userId, request));
+        await SaveAsync(() => set = role == "annotator"
+            ? ApplyAnnotationSet(userId, request with { Annotations = (request.Annotations ?? []).Select(x => x with { Confirmed = false }).ToList() }, "draft")
+            : ApplyAnnotationSet(userId, request));
         return set!;
     }
 
-    AnnotationSet ApplyAnnotationSet(int userId, AnnotationSaveRequest request)
+    AnnotationSet ApplyAnnotationSet(int userId, AnnotationSaveRequest request, string? reviewStatus = null)
     {
         var file = State.Files.FirstOrDefault(x => x.Id == request.FileId && x.UserId == userId);
         if (file is null) throw new BadHttpRequestException("File not found.", 404);
@@ -938,7 +945,12 @@ public sealed class MaskFlowStore
             annotations,
             BuildYoloTxt(annotations, dataType),
             existing?.CreatedAt ?? now,
-            now);
+            now,
+            reviewStatus ?? existing?.ReviewStatus ?? "draft",
+            existing?.ReviewComment,
+            existing?.ReviewedBy,
+            existing?.ReviewedAt,
+            existing?.SubmittedBy);
         State.AnnotationSets.Add(set);
         return set;
     }

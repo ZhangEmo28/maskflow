@@ -2,7 +2,7 @@ using Microsoft.AspNetCore.Http;
 
 namespace MaskFlow.Api.Tests;
 
-sealed class FakeRepository : IMaskFlowRepository
+public sealed class FakeRepository : IMaskFlowRepository
 {
     public int Saves { get; private set; }
     public bool FailNextSave { get; set; }
