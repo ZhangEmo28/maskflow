@@ -80,6 +80,7 @@ export function useMaskFlowApp() {
   const dashboard = reactive({ projects: [], tasks: [], quota: null });
   const files = reactive({ rows: [], selected: null });
   const importer = reactive({ format: "auto", onExisting: "skip", confirmed: true, file: null, busy: false, summary: null, error: "" });
+  const videos = reactive({ rows: [], file: null, everySeconds: 1, maxFrames: 300, busy: false, status: "" });
   const records = reactive({ rows: [] });
   const projects = reactive({ rows: [], selectedId: "", newName: "", newDataType: "detection", status: "" });
   const exportPage = reactive({
@@ -151,6 +152,7 @@ export function useMaskFlowApp() {
     batch: null,
     review: { status: "draft", comment: "" },
     reviewQueue: "all",
+    propagateCount: 10,
     drawMode: false,
     drawingBox: null,
     editDrag: null,
@@ -747,6 +749,78 @@ export function useMaskFlowApp() {
     }
   }
 
+  // ---- Video: upload + frame extraction, propagation over frames ----
+
+  let videoPollTimer = null;
+  const currentFrame = computed(() => {
+    const file = files.rows.find((item) => item.id === annotate.current?.id);
+    return file?.videoId ? { videoId: file.videoId, frameIndex: file.frameIndex } : null;
+  });
+
+  async function loadVideos() {
+    clearTimeout(videoPollTimer);
+    const projectId = projects.selectedId;
+    if (!projectId) {
+      videos.rows = [];
+      return;
+    }
+    const data = await apiFetch(`/api/projects/${projectId}/videos`).catch(() => ({ videos: [] }));
+    if (projectId !== projects.selectedId) return;
+    const wasBusy = videos.rows.some((video) => ["queued", "processing"].includes(video.status));
+    videos.rows = data.videos || [];
+    const busy = videos.rows.some((video) => ["queued", "processing"].includes(video.status));
+    if (busy) videoPollTimer = setTimeout(loadVideos, 2000);
+    else if (wasBusy) await Promise.all([refreshFiles(), refreshProjects()]);
+  }
+
+  async function uploadVideo() {
+    if (!videos.file || !projects.selectedId) return;
+    const form = new FormData();
+    form.append("file", videos.file);
+    form.append("everySeconds", String(videos.everySeconds));
+    form.append("maxFrames", String(videos.maxFrames));
+    videos.busy = true;
+    videos.status = `正在上传 ${videos.file.name}`;
+    try {
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/videos`, { method: "POST", body: form });
+      videos.file = null;
+      videos.status = "上传完成，正在服务器上抽帧，完成后图片会出现在项目里";
+      if (data.user) account.value = data.user;
+      await loadVideos();
+    } catch (error) {
+      videos.status = error.message;
+    } finally {
+      videos.busy = false;
+    }
+  }
+
+  async function deleteVideo(video) {
+    if (!window.confirm(`删除视频 ${video.name}？已抽出的帧会保留为普通图片。`)) return;
+    try {
+      await apiFetch(`/api/projects/${projects.selectedId}/videos/${video.id}`, { method: "DELETE" });
+      await loadVideos();
+    } catch (error) {
+      videos.status = error.message;
+    }
+  }
+
+  async function propagateFromCurrent() {
+    const file = annotate.current;
+    if (!file || !currentFrame.value) return;
+    if (annotate.dirty) {
+      annotate.status = "请先保存当前帧的标注，再向后传播";
+      return;
+    }
+    try {
+      const data = await apiFetch(`/api/annotations/file/${file.id}/propagate`, { method: "POST", body: { count: Number(annotate.propagateCount) || 10 } });
+      applyBatchTask(data.task);
+      scheduleBatchPoll();
+      annotate.status = `正在把当前帧的目标向后传播 ${annotate.batch.total} 帧`;
+    } catch (error) {
+      annotate.status = error.message;
+    }
+  }
+
   // ---- Server-side batch annotation ----
 
   let batchPollTimer = null;
@@ -756,6 +830,7 @@ export function useMaskFlowApp() {
     const result = task.result || {};
     annotate.batch = {
       taskId: task.id,
+      type: task.type,
       projectId: task.projectId,
       status: task.status,
       total: result.total ?? task.imageCount ?? 0,
@@ -793,11 +868,12 @@ export function useMaskFlowApp() {
     if (current && !annotate.dirty) await selectAnnotateFile(current);
     const batch = annotate.batch;
     if (!batch) return;
+    const what = batch.type === "video_propagation" ? "视频传播" : "批量标注";
     annotate.status = batch.status === "completed"
-      ? `批量标注完成：成功 ${batch.succeeded} 张${batch.failed ? `，失败 ${batch.failed} 张` : ""}`
+      ? `${what}完成：成功 ${batch.succeeded} 张${batch.failed ? `，失败 ${batch.failed} 张` : ""}${batch.lastError ? `（${batch.lastError}）` : ""}`
       : batch.status === "cancelled"
-        ? `批量标注已取消，已处理 ${batch.processed} 张`
-        : `批量标注中止：${batch.lastError || "未知错误"}`;
+        ? `${what}已取消，已处理 ${batch.processed} 张`
+        : `${what}中止：${batch.lastError || "未知错误"}`;
   }
 
   async function resumeBatchTracking() {
@@ -807,8 +883,8 @@ export function useMaskFlowApp() {
     if (!projectId) return;
     const data = await apiFetch("/api/tasks").catch(() => ({ tasks: [] }));
     if (projectId !== projects.selectedId) return;
-    const active = (data.tasks || []).find((task) => task.type === "batch_auto_annotation" && task.projectId === projectId
-      && ["queued", "running"].includes(task.status));
+    const active = (data.tasks || []).find((task) => ["batch_auto_annotation", "video_propagation"].includes(task.type)
+      && task.projectId === projectId && ["queued", "running"].includes(task.status));
     if (active) {
       applyBatchTask(active);
       scheduleBatchPoll();
@@ -1769,6 +1845,9 @@ export function useMaskFlowApp() {
     if (annotate.filter === "review") rows = rows.filter((file) => file.unconfirmedCount > 0);
     if (annotate.reviewQueue === "mine") rows = rows.filter((file) => file.assignedTo === account.value?.id);
     else if (annotate.reviewQueue !== "all") rows = rows.filter((file) => (file.reviewStatus || "draft") === annotate.reviewQueue);
+    if (annotate.queueSort === "name") {
+      rows = [...rows].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    }
     if (annotate.queueSort === "uncertain") {
       // Active-learning style review: the least certain unreviewed images first.
       const score = (file) => (file.unconfirmedCount > 0 ? file.minConfidence ?? 1 : 2);
@@ -2932,6 +3011,7 @@ export function useMaskFlowApp() {
     if (page.value === "files" || page.value === "annotate" || page.value === "export") {
       refreshProjects().then(refreshFiles);
     }
+    if (page.value === "files") refreshProjects().then(loadVideos);
     if (page.value === "records") refreshRecords();
     if (page.value === "export") {
       syncExportSplitFromProject();
@@ -2974,7 +3054,7 @@ export function useMaskFlowApp() {
     effectiveAiMode, aiModeValue, setAiMode, labelsNeedingPrompt, saveLabelPrompt, uploadModel, deleteModel,
     team, currentRole, canEditProject, canReviewProject, canManageProject, isSharedProject, roleLabels, reviewLabels,
     openTeamPanel, inviteMember, changeMemberRole, removeMember, revokeInvite, assignImages, reviewCurrent,
-    batchActive, cancelBatch,
+    batchActive, cancelBatch, videos, loadVideos, uploadVideo, deleteVideo, currentFrame, propagateFromCurrent,
     togglePointPromptMode, setAnnotatePointPolarity, setSegmentPointPolarity, setSegmentPromptMode,
     handleAnnotatePointClick, handleSegmentPointClick, onSegmentImageLoad,
     selectAnnotatePointCandidate, selectSegmentPointCandidate,

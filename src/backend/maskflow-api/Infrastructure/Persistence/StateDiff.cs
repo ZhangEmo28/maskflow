@@ -69,6 +69,7 @@ public static class StateDiff
         ProjectMembers = [.. state.ProjectMembers],
         ProjectInvites = [.. state.ProjectInvites],
         FileAssignments = [.. state.FileAssignments],
+        Videos = [.. state.Videos],
         ProjectLabels = new(state.ProjectLabels),
         ProjectLabelPrompts = new(state.ProjectLabelPrompts),
         Quotas = new(state.Quotas),

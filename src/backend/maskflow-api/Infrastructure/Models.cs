@@ -26,6 +26,7 @@ public record MaskFlowState
     public List<ProjectMember> ProjectMembers { get; set; } = [];
     public List<ProjectInvite> ProjectInvites { get; set; } = [];
     public List<FileAssignment> FileAssignments { get; set; } = [];
+    public List<VideoItem> Videos { get; set; } = [];
     public Dictionary<string, List<string>> ProjectLabels { get; set; } = [];
     // projectId -> label -> SAM 3 text prompt (labels without an entry use the label itself)
     public Dictionary<string, Dictionary<string, string>> ProjectLabelPrompts { get; set; } = [];
@@ -85,6 +86,10 @@ public record MemberInviteRequest(string Email, string Role);
 public record MemberRoleRequest(string Role);
 public record AssignmentRequest(List<int>? UserIds, List<int>? FileIds, string Scope = "unassigned");
 public record ReviewRequest(string? Comment);
+// Frames are ordinary project images; FrameFileIds keeps them in playback order (FrameIndexes = source frame numbers).
+public record VideoItem(string Id, int UserId, string ProjectId, string Name, string Path, long Size, double Fps, double DurationSec, double EverySeconds,
+    List<int> FrameFileIds, List<int> FrameIndexes, string Status, string? Error, DateTimeOffset CreatedAt);
+public record PropagateRequest(int Count = 10);
 public record AnnotationItem(string Id, int ClassId, string? Label, YoloBox Bbox, List<double>? Segment, double Confidence, bool Confirmed = false);
 public record YoloBox(double Cx, double Cy, double Width, double Height);
 public record TaskItem(string Id, int UserId, string JobId, string Type, string? Title, string? ProjectId, int? FileId, int ImageCount, string Status, double Progress, Dictionary<string, object?>? Result, string? ErrorMessage, DateTimeOffset CreatedAt, DateTimeOffset? StartedAt, DateTimeOffset? FinishedAt);

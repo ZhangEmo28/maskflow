@@ -26,6 +26,8 @@
 - **Fast review** — move/resize boxes, edit polygon vertices, undo/redo, keyboard shortcuts, wheel zoom and space-drag panning, and a lowest-confidence-first review queue.
 - **Training dataset export** — YOLO detection, YOLO segmentation, COCO, Pascal VOC, or classification crops with train / val / test splits; near-duplicate images stay in the same split, and you can export human-confirmed targets only.
 - **Dataset import** — upload a zip or a single annotation file; YOLO, COCO, LabelMe and VOC are detected automatically and matched to images by file name.
+- **Team collaboration** — invite members per project (reviewer / annotator / viewer), assign images, and run a submit → approve / reject review flow; invitations, password resets and task notices go out by email.
+- **Video annotation** — upload a video to extract frames, label one frame, and let SAM propagate the boxes frame by frame with their classes.
 - **Task tracking** — processing history, AI usage quotas, and project-level statistics.
 - **Self-hosted deployment** — Docker Compose runs the Vue frontend, .NET API, FastAPI inference service, MySQL, and MinIO.
 

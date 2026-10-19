@@ -18,6 +18,9 @@ const importer = inject("importer");
 const importDataset = inject("importDataset");
 const downloadFileItem = inject("downloadFileItem");
 const formatDateTime = inject("formatDateTime");
+const videos = inject("videos");
+const uploadVideo = inject("uploadVideo");
+const deleteVideo = inject("deleteVideo");
 </script>
 
 <template>
@@ -67,6 +70,30 @@ const formatDateTime = inject("formatDateTime");
           </div>
           <p v-if="projects.status">{{ projects.status }}</p>
           <p v-if="account">空间：{{ formatBytes(account.usedBytes) }} / {{ formatBytes(account.quotaBytes) }}</p>
+        </article>
+        <article class="work-card video-card">
+          <h2>上传视频抽帧</h2>
+          <p>上传 mp4 / mov / webm 等视频，服务器按间隔抽帧，帧会作为普通图片加入项目；标注一帧后可在标注页“向后传播”。</p>
+          <div class="import-options video-options">
+            <label>每隔几秒抽一帧<input v-model.number="videos.everySeconds" type="number" min="0.04" step="0.5" /></label>
+            <label>最多帧数<input v-model.number="videos.maxFrames" type="number" min="1" max="2000" /></label>
+          </div>
+          <input type="file" accept="video/*,.mkv" :disabled="videos.busy" @change="videos.file = $event.target.files[0] || null" />
+          <button class="btn" type="button" :disabled="videos.busy || !videos.file || !projects.selectedId" @click="uploadVideo">
+            {{ videos.busy ? '正在上传…' : '上传并抽帧' }}
+          </button>
+          <p v-if="videos.status">{{ videos.status }}</p>
+          <ul v-if="videos.rows.length" class="video-list">
+            <li v-for="video in videos.rows" :key="video.id">
+              <div>
+                <strong>{{ video.name }}</strong>
+                <small>
+                  {{ { queued: '排队中', processing: '抽帧中…', ready: video.frameCount + ' 帧 · ' + Number(video.durationSec).toFixed(1) + ' 秒', failed: '失败：' + video.error }[video.status] }}
+                </small>
+              </div>
+              <button class="label-delete-btn" type="button" @click="deleteVideo(video)">删除</button>
+            </li>
+          </ul>
         </article>
         <article class="work-card import-card">
           <h2>导入已有数据集</h2>

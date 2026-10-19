@@ -878,6 +878,12 @@ public sealed partial class MaskFlowStore
             State.ProjectLabels.Remove(projectId);
             State.ProjectLabelPrompts.Remove(projectId);
             State.ProjectMembers.RemoveAll(x => x.ProjectId == projectId);
+            foreach (var video in State.Videos.Where(x => x.ProjectId == projectId))
+            {
+                deleteAfterCommit.Add(video.Path);
+            }
+
+            State.Videos.RemoveAll(x => x.ProjectId == projectId);
             State.ProjectInvites.RemoveAll(x => x.ProjectId == projectId);
             State.Projects.Remove(project);
             deleted = true;

@@ -12,14 +12,40 @@ public sealed class AnnotationController : ControllerBase
     private readonly SamInferenceGate samGate;
     private readonly AutoAnnotationService annotator;
     private readonly BatchAnnotationWorker worker;
+    private readonly VideoTaskWorker videoWorker;
 
-    public AnnotationController(MaskFlowStore store, IHttpClientFactory clientFactory, SamInferenceGate samGate, AutoAnnotationService annotator, BatchAnnotationWorker worker)
+    public AnnotationController(MaskFlowStore store, IHttpClientFactory clientFactory, SamInferenceGate samGate, AutoAnnotationService annotator, BatchAnnotationWorker worker, VideoTaskWorker videoWorker)
     {
         this.store = store;
         this.clientFactory = clientFactory;
         this.samGate = samGate;
         this.annotator = annotator;
         this.worker = worker;
+        this.videoWorker = videoWorker;
+    }
+
+    // Carry the labelled boxes of a video frame forward over the next `count` frames (background task).
+    [HttpPost("/api/annotations/file/{fileId:int}/propagate")]
+    public async Task<IActionResult> Propagate(int fileId, [FromBody] PropagateRequest? request)
+    {
+        var user = store.RequireUser(HttpContext);
+        var (_, ownerId, _) = store.RequireFileAccess(user.Id, fileId, Permissions.Edit);
+        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
+        var video = store.VideoForFile(fileId);
+        if (video is null) return BadRequest(new { detail = "这张图片不是视频帧，无法传播。" });
+        if (!(store.GetAnnotationSet(ownerId, fileId)?.Annotations.Any(MaskFlowStore.IsExportableAnnotation) ?? false))
+        {
+            return BadRequest(new { detail = "当前帧还没有已分配类别的目标，先标注并保存当前帧。" });
+        }
+
+        var remaining = video.FrameFileIds.Count - video.FrameFileIds.IndexOf(fileId) - 1;
+        if (remaining <= 0) return BadRequest(new { detail = "已经是最后一帧了。" });
+        var busy = store.State.Tasks.Any(x => x.Type == MaskFlowStore.VideoPropagationTaskType && x.ProjectId == video.ProjectId && x.Status is "queued" or "running");
+        if (busy) return Conflict(new { detail = "该项目已有正在进行的视频传播任务。" });
+
+        var task = await store.CreatePropagationTaskAsync(ownerId, video, fileId, Math.Clamp(request?.Count ?? 10, 1, remaining));
+        videoWorker.Wake();
+        return Ok(new { task });
     }
 
     [HttpPost("/api/annotations/auto")]

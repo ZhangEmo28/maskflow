@@ -6798,3 +6798,46 @@ body:has(.app-sidebar) {
 .review-badge.submitted { color: #1d4ed8; }
 .review-badge.approved { color: #15803d; }
 .review-badge.rejected { color: #b91c1c; }
+
+/* Video frames */
+.frame-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #334155;
+}
+
+.frame-tools input {
+  width: 64px;
+  height: 30px;
+  padding: 0 6px;
+}
+
+.video-options input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.video-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.video-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid #eef2f7;
+}
+
+.video-list small {
+  display: block;
+  color: #64748b;
+  font-size: 12px;
+}

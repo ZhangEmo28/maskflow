@@ -76,7 +76,7 @@
 
       <section v-if="annotate.batch" :class="['batch-progress', annotate.batch.status]" aria-live="polite">
         <div class="batch-progress-text">
-          <strong>{{ batchActive ? (annotate.batch.status === 'queued' ? '批量标注排队中' : '批量标注进行中') : annotate.batch.status === 'completed' ? '批量标注已完成' : annotate.batch.status === 'cancelled' ? '批量标注已取消' : '批量标注已中止' }}</strong>
+          <strong>{{ (annotate.batch.type === 'video_propagation' ? '视频传播' : '批量标注') + (batchActive ? (annotate.batch.status === 'queued' ? '排队中' : '进行中') : annotate.batch.status === 'completed' ? '已完成' : annotate.batch.status === 'cancelled' ? '已取消' : '已中止') }}</strong>
           <span>{{ annotate.batch.processed }} / {{ annotate.batch.total }} 张 · 成功 {{ annotate.batch.succeeded }} · 失败 {{ annotate.batch.failed }}</span>
           <small v-if="annotate.batch.lastError">最近错误：{{ annotate.batch.lastError }}</small>
         </div>
@@ -107,6 +107,7 @@
           <select v-model="annotate.queueSort" class="queue-sort" aria-label="图片排序">
             <option value="default">默认顺序</option>
             <option value="uncertain">低置信度优先（先复核最不确定的）</option>
+            <option value="name">按文件名（视频帧顺序）</option>
           </select>
           <div class="queue-list">
             <button v-for="file in filteredFiles" :key="file.id" :class="['file-row-btn', { active: annotate.current?.id === file.id }]" type="button" @click="selectAnnotateFile(file)">
@@ -146,6 +147,11 @@
             <span>{{ currentFileIndex >= 0 ? currentFileIndex + 1 : 0 }} / {{ filteredFiles.length }} · {{ annotate.current?.name || '未选择图片' }}</span>
             <button class="btn secondary compact-btn" type="button" :disabled="currentFileIndex >= filteredFiles.length - 1" title="下一张 (D)" @click="selectAdjacentFile(1)">下一张</button>
             <button class="btn ghost compact-btn" type="button" title="快捷键 (?)" @click="annotate.showShortcutHelp = !annotate.showShortcutHelp">快捷键</button>
+            <span v-if="currentFrame" class="frame-tools">
+              视频帧 #{{ currentFrame.frameIndex }}
+              <input v-model.number="annotate.propagateCount" type="number" min="1" max="500" aria-label="传播帧数" />
+              <button class="btn secondary compact-btn" type="button" :disabled="loading || batchActive || !canEditProject || !annotate.ready" title="用当前帧已分配类别的目标，逐帧向后跟踪" @click="propagateFromCurrent">向后传播</button>
+            </span>
             <button v-if="canReviewProject" class="btn danger compact-btn" type="button" :disabled="loading || !annotate.current" @click="deleteCurrentAnnotateFile">删除图片</button>
           </div>
           <div v-if="annotate.current" class="yolo-canvas">
@@ -479,6 +485,8 @@ const roleLabels = inject("roleLabels");
 const reviewLabels = inject("reviewLabels");
 const openTeamPanel = inject("openTeamPanel");
 const reviewCurrent = inject("reviewCurrent");
+const currentFrame = inject("currentFrame");
+const propagateFromCurrent = inject("propagateFromCurrent");
 const toggleManualDrawMode = inject("toggleManualDrawMode");
 const togglePointPromptMode = inject("togglePointPromptMode");
 const setAnnotatePointPolarity = inject("setAnnotatePointPolarity");

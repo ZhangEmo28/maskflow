@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageOps
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -1265,3 +1266,170 @@ async def yolo_predict(
             temp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+# --- Video: frame extraction and box-prompt propagation ---
+
+MAX_VIDEO_BYTES = int(os.getenv("VIDEO_MAX_BYTES", str(1024 * 1024 * 1024)))
+MAX_VIDEO_FRAMES = int(os.getenv("VIDEO_MAX_FRAMES", "2000"))
+
+
+def _extract_frames(video_path: Path, every_seconds: float, max_frames: int) -> tuple[bytes, dict[str, Any]]:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise HTTPException(status_code=400, detail="无法解码视频，请使用 mp4 / mov / webm 等常见格式。")
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = fps if fps > 0 else 25.0
+        step = max(1, round(every_seconds * fps))
+        buffer = io.BytesIO()
+        frames: list[dict[str, Any]] = []
+        index = 0
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+            while len(frames) < max_frames:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index % step == 0:
+                    encoded_ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                    if encoded_ok:
+                        name = f"frame_{index:06d}.jpg"
+                        archive.writestr(name, encoded.tobytes())
+                        frames.append({"index": index, "time": round(index / fps, 3), "file": name})
+                index += 1
+            manifest = {
+                "fps": fps,
+                "frameCount": total or index,
+                "duration": round((total or index) / fps, 3),
+                "everySeconds": every_seconds,
+                "frames": frames,
+            }
+            archive.writestr("manifest.json", json.dumps(manifest))
+        if not frames:
+            raise HTTPException(status_code=400, detail="视频中没有读到任何帧。")
+        return buffer.getvalue(), manifest
+    finally:
+        capture.release()
+
+
+@app.post("/api/video/frames")
+async def video_frames(
+    video: UploadFile = File(...),
+    every_seconds: float = Form(1.0),
+    max_frames: int = Form(300),
+) -> Response:
+    if not 0.04 <= every_seconds <= 3600:
+        raise HTTPException(status_code=400, detail="every_seconds must be between 0.04 and 3600.")
+    max_frames = max(1, min(max_frames, MAX_VIDEO_FRAMES))
+    suffix = Path(video.filename or "video.mp4").suffix.lower() or ".mp4"
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    temp_path = Path(temp.name)
+    size = 0
+    try:
+        with temp:
+            while chunk := await video.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_VIDEO_BYTES:
+                    raise HTTPException(status_code=413, detail="Video is too large.")
+                temp.write(chunk)
+        content, _ = await run_in_threadpool(_extract_frames, temp_path, every_seconds, max_frames)
+        return Response(content=content, media_type="application/zip")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _parse_propagation_boxes(raw: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="boxes must be JSON.") from exc
+    if not isinstance(data, list) or not data or len(data) > 100:
+        raise HTTPException(status_code=400, detail="Provide 1-100 boxes.")
+    boxes = []
+    for item in data:
+        box = item.get("box") if isinstance(item, dict) else None
+        try:
+            cx, cy, w, h = (float(box[key]) for key in ("cx", "cy", "width", "height"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Each box needs cx, cy, width, height.") from exc
+        boxes.append({"id": str(item.get("id") or len(boxes)), "box": (cx, cy, w, h)})
+    return boxes
+
+
+def _box_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    left, top = max(a[0], b[0]), max(a[1], b[1])
+    right, bottom = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, right - left) * max(0.0, bottom - top)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _run_propagation(temp_path: Path, pil_image: Image.Image, boxes: list[dict[str, Any]], scale: float, margin: float) -> dict[str, Any]:
+    """Re-segment each object on the next frame, prompting SAM with its previous box (slightly enlarged)."""
+    width, height = pil_image.size
+    prompts = []
+    for item in boxes:
+        cx, cy, w, h = item["box"]
+        x1 = max(0.0, (cx - w / 2 - w * margin)) * width
+        y1 = max(0.0, (cy - h / 2 - h * margin)) * height
+        x2 = min(1.0, (cx + w / 2 + w * margin)) * width
+        y2 = min(1.0, (cy + h / 2 + h * margin)) * height
+        prompts.append([x1 * scale, y1 * scale, x2 * scale, y2 * scale])
+
+    model = _get_auto_model()
+    try:
+        with _inference_lock:
+            results = model.predict(source=str(temp_path), bboxes=prompts, device=_get_device(), retina_masks=True, verbose=False)
+        masks, scores = _extract_mask_arrays(results)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    geometries = []
+    for mask, score in zip(masks, scores):
+        geometry = _mask_to_geometry(mask, width, height)
+        if geometry is not None:
+            geometries.append((geometry, score))
+
+    # SAM returns one mask per box in order; fall back to best overlap if the counts differ.
+    results_out = []
+    used: set[int] = set()
+    for index, item in enumerate(boxes):
+        prompt = tuple(value / scale for value in prompts[index])
+        candidate = None
+        if len(geometries) == len(boxes):
+            candidate = index
+        else:
+            best = 0.0
+            for g_index, (geometry, _) in enumerate(geometries):
+                if g_index in used:
+                    continue
+                b = geometry["box"]
+                overlap = _box_iou(prompt, (b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"]))
+                if overlap > best:
+                    best, candidate = overlap, g_index
+        if candidate is None:
+            results_out.append({"id": item["id"], "lost": True})
+            continue
+        used.add(candidate)
+        geometry, score = geometries[candidate]
+        results_out.append({"id": item["id"], "lost": False, "score": float(score), "yoloBox": geometry["yoloBox"], "yoloSegments": geometry["yoloSegments"]})
+    return {"width": width, "height": height, "results": results_out}
+
+
+@app.post("/api/video/propagate")
+async def video_propagate(
+    image: UploadFile = File(...),
+    boxes: str = Form(...),
+    margin: float = Form(0.15),
+) -> dict[str, Any]:
+    parsed = _parse_propagation_boxes(boxes)
+    margin = max(0.0, min(margin, 1.0))
+    content = await image.read()
+    temp_path, pil_image, scale = await run_in_threadpool(_image_to_temp_file_with_scale, image, content)
+    try:
+        return await run_in_threadpool(_run_propagation, temp_path, pil_image, parsed, scale, margin)
+    finally:
+        temp_path.unlink(missing_ok=True)

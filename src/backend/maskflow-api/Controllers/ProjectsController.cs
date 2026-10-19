@@ -6,12 +6,62 @@ public sealed class ProjectsController : MaskFlowControllerBase
 {
     readonly ProjectService projectService;
     readonly AccountMailer mailer;
+    readonly VideoTaskWorker videoWorker;
 
-    public ProjectsController(MaskFlowStore store, ProjectService projectService, AccountMailer mailer) : base(store)
+    public ProjectsController(MaskFlowStore store, ProjectService projectService, AccountMailer mailer, VideoTaskWorker videoWorker) : base(store)
     {
         this.projectService = projectService;
         this.mailer = mailer;
+        this.videoWorker = videoWorker;
     }
+
+    // ---- Videos: upload a clip, frames are extracted in the background into project images ----
+
+    [HttpPost("{projectId}/videos")]
+    public async Task<IActionResult> UploadVideo(string projectId)
+    {
+        var user = CurrentUser();
+        var access = Store.RequireProjectAccess(user.Id, projectId, Permissions.Edit);
+        var form = await Request.ReadFormAsync();
+        var file = form.Files.FirstOrDefault();
+        if (file is null) return BadRequest(new { detail = "请选择视频文件。" });
+        var everySeconds = double.TryParse(form["everySeconds"].FirstOrDefault(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds) ? seconds : 1;
+        var maxFrames = int.TryParse(form["maxFrames"].FirstOrDefault(), out var frames) ? frames : 300;
+        var (video, task) = await Store.AddVideoAsync(Store.GetUser(access.OwnerId)!, file, projectId, everySeconds, maxFrames);
+        videoWorker.Wake();
+        return Ok(new { video = VideoDto(video), task, user = Store.PublicUser(Store.GetUser(user.Id)!) });
+    }
+
+    [HttpGet("{projectId}/videos")]
+    public IActionResult Videos(string projectId)
+    {
+        var user = CurrentUser();
+        Store.RequireProjectAccess(user.Id, projectId, Permissions.Read);
+        return Ok(new { videos = Store.State.Videos.Where(x => x.ProjectId == projectId).OrderByDescending(x => x.CreatedAt).Select(VideoDto) });
+    }
+
+    [HttpDelete("{projectId}/videos/{videoId}")]
+    public async Task<IActionResult> DeleteVideo(string projectId, string videoId)
+    {
+        var user = CurrentUser();
+        Store.RequireProjectAccess(user.Id, projectId, Permissions.Review);
+        return await Store.DeleteVideoAsync(projectId, videoId) ? Ok(new { ok = true }) : NotFound(new { detail = "Video not found." });
+    }
+
+    static object VideoDto(VideoItem video) => new
+    {
+        video.Id,
+        video.Name,
+        video.Size,
+        video.Fps,
+        video.DurationSec,
+        video.EverySeconds,
+        FrameCount = video.FrameFileIds.Count,
+        FirstFrameId = video.FrameFileIds.FirstOrDefault(),
+        video.Status,
+        video.Error,
+        video.CreatedAt
+    };
 
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] ProjectCreate request)
