@@ -1,6 +1,10 @@
+public sealed record MaskFlowLoadResult(MaskFlowState? State, bool RequiresFullWrite);
+
 public interface IMaskFlowRepository
 {
     Task EnsureSchemaAsync();
-    Task<MaskFlowState?> LoadAsync();
-    Task SaveAsync(MaskFlowState state, IReadOnlyCollection<string>? syncProjectLabelIds = null);
+    Task<MaskFlowLoadResult> LoadAsync();
+
+    // previous == null: write the whole state (e.g. migrating a legacy JSON state).
+    Task SaveChangesAsync(MaskFlowState? previous, MaskFlowState current);
 }

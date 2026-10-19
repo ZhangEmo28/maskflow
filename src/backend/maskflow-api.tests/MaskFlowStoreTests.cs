@@ -7,10 +7,13 @@ sealed class FakeRepository : IMaskFlowRepository
     public int Saves { get; private set; }
     public bool FailNextSave { get; set; }
 
-    public Task EnsureSchemaAsync() => Task.CompletedTask;
-    public Task<MaskFlowState?> LoadAsync() => Task.FromResult<MaskFlowState?>(null);
+    public MaskFlowState? Initial { get; set; }
+    public List<(MaskFlowState? Previous, MaskFlowState Current)> Writes { get; } = [];
 
-    public Task SaveAsync(MaskFlowState state, IReadOnlyCollection<string>? syncProjectLabelIds = null)
+    public Task EnsureSchemaAsync() => Task.CompletedTask;
+    public Task<MaskFlowLoadResult> LoadAsync() => Task.FromResult(new MaskFlowLoadResult(Initial, Initial is null));
+
+    public Task SaveChangesAsync(MaskFlowState? previous, MaskFlowState current)
     {
         if (FailNextSave)
         {
@@ -19,15 +22,16 @@ sealed class FakeRepository : IMaskFlowRepository
         }
 
         Saves++;
+        Writes.Add((previous, current));
         return Task.CompletedTask;
     }
 }
 
 static class TestStore
 {
-    public static (MaskFlowStore Store, FakeRepository Repository) Create()
+    public static (MaskFlowStore Store, FakeRepository Repository) Create(MaskFlowState? initial = null)
     {
-        var repository = new FakeRepository();
+        var repository = new FakeRepository { Initial = initial };
         var store = new MaskFlowStore(repository);
         store.Initialize();
         return (store, repository);
@@ -174,5 +178,135 @@ public class MaskFlowStoreTests
 
         Assert.Equal(0, quota.DailyUsed);
         Assert.Equal(49, store.State.Quotas[user.Id.ToString()].DailyUsed);
+    }
+}
+
+public class MaskFlowStoreConcurrencyTests
+{
+    [Fact]
+    public async Task Readers_NeverSeeUncommittedWrites()
+    {
+        var (store, _) = TestStore.Create();
+        var entered = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+
+        var write = store.SaveAsync(async () =>
+        {
+            store.State.Pools.Add(new Pool("pending", "Pending", "gpu", null, "active", [], [], DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+            entered.SetResult();
+            await release.Task;
+        });
+
+        await entered.Task;
+        // A different async flow (another request) still sees the committed snapshot.
+        var visibleDuringWrite = await Task.Run(() => store.State.Pools.Any(x => x.Id == "pending"));
+        release.SetResult();
+        await write;
+
+        Assert.False(visibleDuringWrite);
+        Assert.Contains(store.State.Pools, x => x.Id == "pending");
+    }
+
+    [Fact]
+    public async Task FailedWrites_AreNeverPublished()
+    {
+        var (store, repository) = TestStore.Create();
+        repository.FailNextSave = true;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.SaveAsync(() =>
+            store.State.Pools.Add(new Pool("ghost", "Ghost", "gpu", null, "active", [], [], DateTimeOffset.UtcNow, DateTimeOffset.UtcNow))));
+
+        Assert.DoesNotContain(store.State.Pools, x => x.Id == "ghost");
+    }
+
+    [Fact]
+    public async Task Writes_PassOnlyTheChangedRowsToTheRepository()
+    {
+        var (store, repository) = TestStore.Create();
+        var user = await TestStore.RegisterAsync(store);
+        var project = await store.CreateProjectAsync(user.Id, new ProjectCreate("p", null, null, null));
+        await TestStore.AddFileAsync(store, user.Id, project.Id);
+
+        await store.UpdateProjectAsync(user.Id, project.Id, new ProjectCreate("renamed", null, null, null));
+
+        var (previous, current) = repository.Writes[^1];
+        Assert.Single(StateDiff.Compare(previous!.Projects, current.Projects, x => x.Id).Upserts);
+        Assert.True(StateDiff.Compare(previous.Files, current.Files, x => x.Id).IsEmpty);
+        Assert.True(StateDiff.Compare(previous.Users, current.Users, x => x.Id).IsEmpty);
+    }
+
+    [Fact]
+    public async Task Sessions_StoreOnlyTokenHashes()
+    {
+        var (store, _) = TestStore.Create();
+        var result = await store.RegisterAsync("hash@example.com", "correct-horse-battery", null, new DefaultHttpContext());
+
+        Assert.DoesNotContain(store.State.Sessions, x => x.Token == result!.Token);
+        Assert.NotNull(store.OptionalUser(WithBearer(result!.Token)));
+        Assert.Null(store.OptionalUser(WithBearer(store.State.Sessions[0].Token)));
+    }
+
+    [Fact]
+    public void LegacyPlaintextSessions_AreHashedOnStartup()
+    {
+        var legacy = new MaskFlowState();
+        legacy.Users.Add(new User(1, "old@example.com", "x", "00", "free", 1, 0, DateTimeOffset.UtcNow, null, null, null));
+        legacy.Sessions.Add(new Session("plain-token-from-before", 1, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddDays(1)));
+
+        var (store, _) = TestStore.Create(legacy);
+
+        Assert.Equal(Util.Sha256("plain-token-from-before"), store.State.Sessions[0].Token);
+        Assert.Equal(1, store.OptionalUser(WithBearer("plain-token-from-before"))!.Id);
+    }
+
+    static HttpContext WithBearer(string token)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Headers.Authorization = $"Bearer {token}";
+        return context;
+    }
+}
+
+public class ProjectCopyTests
+{
+    [Fact]
+    public async Task CopyProject_CopiesFilesAndRemovesCopiesWhenCommitFails()
+    {
+        var (store, repository) = TestStore.Create();
+        var user = await TestStore.RegisterAsync(store);
+        var project = await store.CreateProjectAsync(user.Id, new ProjectCreate("src", null, "detection", null));
+        await store.SaveProjectLabelsAsync(user.Id, project.Id, ["car"]);
+        var path = Path.Combine(Path.GetTempPath(), $"maskflow-copy-{Guid.NewGuid():N}.jpg");
+        await File.WriteAllBytesAsync(path, [9, 9, 9]);
+        try
+        {
+            var file = await TestStore.AddFileAsync(store, user.Id, project.Id, path);
+            await store.SaveAnnotationSetAsync(user.Id, new AnnotationSaveRequest(file.Id, 10, 10,
+                [new AnnotationItem("a", 0, "car", new YoloBox(0.5, 0.5, 0.2, 0.2), null, 1, true)]));
+
+            // Other test classes write exports under the same storage root in parallel; only look at project copies.
+            HashSet<string> ProjectCopies() => Directory.Exists(store.StorageRoot)
+                ? Directory.EnumerateFiles(store.StorageRoot, "*", SearchOption.AllDirectories)
+                    .Where(x => x.Contains($"{Path.DirectorySeparatorChar}projects{Path.DirectorySeparatorChar}"))
+                    .ToHashSet()
+                : [];
+            var copiesBefore = ProjectCopies();
+            repository.FailNextSave = true;
+            await Assert.ThrowsAsync<InvalidOperationException>(() => store.CopyProjectAsync(user.Id, project.Id, new ProjectCopyRequest("copy")));
+            Assert.Single(store.State.Projects);
+            Assert.Equal(copiesBefore, ProjectCopies());
+
+            var copied = await store.CopyProjectAsync(user.Id, project.Id, new ProjectCopyRequest("copy"));
+            var copiedFile = Assert.Single(store.State.Files, x => x.ProjectId == copied!.Id);
+            Assert.NotEqual(path, copiedFile.Path);
+            Assert.Equal([9, 9, 9], await File.ReadAllBytesAsync(copiedFile.Path));
+            Assert.Equal(["car"], store.State.ProjectLabels[copied!.Id]);
+            Assert.Equal("car", Assert.Single(store.State.AnnotationSets, x => x.FileId == copiedFile.Id).Annotations[0].Label);
+            File.Delete(copiedFile.Path);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }

@@ -18,15 +18,17 @@ public sealed class MaskFlowStore
 {
     readonly SemaphoreSlim gate = new(1, 1);
     readonly IMaskFlowRepository repository;
-    static readonly JsonSerializerOptions StateJsonOptions = new(JsonSerializerDefaults.Web);
     public string StorageRoot { get; } = Environment.GetEnvironmentVariable("MASKFLOW_STORAGE") ?? Path.Combine(AppContext.BaseDirectory, "data", "storage");
     string MinioEndpoint => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_ENDPOINT") ?? "";
     string MinioAccessKey => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_ACCESS_KEY") ?? "";
     string MinioSecretKey => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_SECRET_KEY") ?? "";
     string MinioBucket => Environment.GetEnvironmentVariable("MASKFLOW_MINIO_BUCKET") ?? "maskflow";
     bool UseMinio => !string.IsNullOrWhiteSpace(MinioEndpoint);
-    public MaskFlowState State { get; private set; } = new();
-    readonly HashSet<string> pendingProjectLabelSync = new(StringComparer.Ordinal);
+    // Readers always see the last committed snapshot; a writer sees its private working copy
+    // (flowed through AsyncLocal) until the database commit succeeds and it is published.
+    MaskFlowState published = new();
+    readonly AsyncLocal<MaskFlowState?> writerState = new();
+    public MaskFlowState State => writerState.Value ?? Volatile.Read(ref published);
     readonly List<string> deleteAfterCommit = [];
     readonly List<string> deleteOnRollback = [];
     readonly Lazy<AmazonS3Client> s3Client;
@@ -44,11 +46,14 @@ public sealed class MaskFlowStore
     {
         Directory.CreateDirectory(StorageRoot);
         repository.EnsureSchemaAsync().GetAwaiter().GetResult();
-        State = repository.LoadAsync().GetAwaiter().GetResult() ?? new MaskFlowState();
+        var loaded = repository.LoadAsync().GetAwaiter().GetResult();
         EnsureMinioBucketAsync().GetAwaiter().GetResult();
-        Seed();
-        SyncTaskJobStatuses();
-        SaveAsync().GetAwaiter().GetResult();
+        var state = StateDiff.Snapshot(loaded.State ?? new MaskFlowState());
+        Seed(state);
+        SyncTaskJobStatuses(state);
+        HashLegacySessionTokens(state);
+        repository.SaveChangesAsync(loaded.RequiresFullWrite ? null : loaded.State, state).GetAwaiter().GetResult();
+        Volatile.Write(ref published, state);
     }
 
     public Task SaveAsync() => SaveAsync(mutate: null);
@@ -67,30 +72,28 @@ public sealed class MaskFlowStore
         List<string> storageCleanup;
         Exception? failure = null;
         await gate.WaitAsync();
-        var original = State;
-        var working = CloneState(original);
-        var originalPendingLabels = pendingProjectLabelSync.ToHashSet(StringComparer.Ordinal);
+        var original = Volatile.Read(ref published);
+        var working = StateDiff.Snapshot(original);
         try
         {
-            State = working;
+            writerState.Value = working;
             if (mutateAsync is not null)
             {
                 await mutateAsync();
             }
 
-            await repository.SaveAsync(State, TakePendingProjectLabelSync());
+            await repository.SaveChangesAsync(original, working);
+            Volatile.Write(ref published, working);
             storageCleanup = [.. deleteAfterCommit];
         }
         catch (Exception ex)
         {
-            State = original;
-            pendingProjectLabelSync.Clear();
-            pendingProjectLabelSync.UnionWith(originalPendingLabels);
             storageCleanup = [.. deleteOnRollback];
             failure = ex;
         }
         finally
         {
+            writerState.Value = null;
             deleteAfterCommit.Clear();
             deleteOnRollback.Clear();
             gate.Release();
@@ -119,24 +122,6 @@ public sealed class MaskFlowStore
             }
         }
     }
-
-    static MaskFlowState CloneState(MaskFlowState state) =>
-        JsonSerializer.Deserialize<MaskFlowState>(JsonSerializer.Serialize(state, StateJsonOptions), StateJsonOptions)
-        ?? new MaskFlowState();
-
-    IReadOnlyCollection<string>? TakePendingProjectLabelSync()
-    {
-        if (pendingProjectLabelSync.Count == 0)
-        {
-            return null;
-        }
-
-        var ids = pendingProjectLabelSync.ToList();
-        pendingProjectLabelSync.Clear();
-        return ids;
-    }
-
-    void MarkProjectLabelsDirty(string projectId) => pendingProjectLabelSync.Add(projectId);
 
     public async Task<T> MutateAsync<T>(Func<MaskFlowState, T> mutate)
     {
@@ -249,7 +234,8 @@ public sealed class MaskFlowStore
         var token = auth["Bearer ".Length..].Trim();
         if (string.IsNullOrWhiteSpace(token)) return null;
 
-        var session = State.Sessions.FirstOrDefault(x => x.Token == token);
+        var tokenHash = Util.Sha256(token);
+        var session = State.Sessions.FirstOrDefault(x => x.Token == tokenHash);
         if (session is not null && session.ExpiresAt >= DateTimeOffset.UtcNow)
         {
             return GetUser(session.UserId);
@@ -257,8 +243,7 @@ public sealed class MaskFlowStore
 
         if (token.StartsWith("mf_", StringComparison.Ordinal))
         {
-            var hash = Util.Sha256(token);
-            var apiToken = State.ApiTokens.FirstOrDefault(x => x.TokenHash == hash && x.RevokedAt is null);
+            var apiToken = State.ApiTokens.FirstOrDefault(x => x.TokenHash == tokenHash && x.RevokedAt is null);
             if (apiToken is not null)
             {
                 return GetUser(apiToken.UserId);
@@ -543,7 +528,6 @@ public sealed class MaskFlowStore
                 request.Split ?? new SplitConfig(70, 20, 10), 0, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
             State.Projects.Add(project);
             State.ProjectLabels[project.Id] = [];
-            MarkProjectLabelsDirty(project.Id);
         });
         return project!;
     }
@@ -573,67 +557,72 @@ public sealed class MaskFlowStore
         return updated;
     }
 
+    // Object copies can take minutes for big projects, so they run outside the write lock;
+    // only the final record creation is serialized, and copies are removed if it fails.
     public async Task<Project?> CopyProjectAsync(int userId, string sourceProjectId, ProjectCopyRequest request)
     {
-        Project? copied = null;
-        await SaveAsync(async () =>
-        {
-            var source = State.Projects.FirstOrDefault(x => x.Id == sourceProjectId && x.UserId == userId);
-            if (source is null) return;
+        var snapshot = State;
+        var source = snapshot.Projects.FirstOrDefault(x => x.Id == sourceProjectId && x.UserId == userId);
+        if (source is null) return null;
 
-            var sourceFiles = State.Files
-                .Where(x => x.UserId == userId && x.ProjectId == sourceProjectId)
-                .OrderBy(x => x.CreatedAt)
-                .ToList();
-            var currentUser = GetUser(userId)!;
-            var copiedBytes = sourceFiles.Sum(x => x.Size);
-            if (currentUser.UsedBytes + copiedBytes > currentUser.QuotaBytes)
+        var sourceFiles = snapshot.Files
+            .Where(x => x.UserId == userId && x.ProjectId == sourceProjectId)
+            .OrderBy(x => x.CreatedAt)
+            .ToList();
+        var copiedBytes = sourceFiles.Sum(x => x.Size);
+        EnsureStorageAvailable(snapshot.Users.First(x => x.Id == userId), copiedBytes);
+
+        var newProjectId = "proj_" + Util.Id();
+        var copiedPaths = new Dictionary<int, string>();
+        try
+        {
+            foreach (var sourceFile in sourceFiles)
             {
-                throw new BadHttpRequestException("Storage quota exceeded.", 403);
+                copiedPaths[sourceFile.Id] = await CopyStoredObjectAsync(sourceFile.Path, userId, newProjectId, sourceFile.Name, sourceFile.ContentType);
             }
+        }
+        catch
+        {
+            await DeleteStoredObjectsQuietlyAsync(copiedPaths.Values);
+            throw;
+        }
+
+        Project? copied = null;
+        await SaveAsync(() =>
+        {
+            deleteOnRollback.AddRange(copiedPaths.Values);
+            var current = State.Projects.FirstOrDefault(x => x.Id == sourceProjectId && x.UserId == userId)
+                ?? throw new BadHttpRequestException("Project not found.", 404);
+            var currentUser = GetUser(userId)!;
+            EnsureStorageAvailable(currentUser, copiedBytes);
 
             var now = DateTimeOffset.UtcNow;
-            var nextName = string.IsNullOrWhiteSpace(request.Name) ? $"{source.Name} 副本" : request.Name.Trim();
-            copied = new Project("proj_" + Util.Id(), userId, nextName, source.Description, source.DataType, source.Split, 0, 0, now, now);
+            var nextName = string.IsNullOrWhiteSpace(request.Name) ? $"{current.Name} 副本" : request.Name.Trim();
+            copied = new Project(newProjectId, userId, nextName, current.Description, current.DataType, current.Split, 0, 0, now, now);
             State.Projects.Add(copied);
-
-            var sourceLabels = GetProjectLabels(userId, sourceProjectId).ToList();
-            State.ProjectLabels[copied.Id] = sourceLabels;
-            MarkProjectLabelsDirty(copied.Id);
+            State.ProjectLabels[copied.Id] = GetProjectLabels(userId, sourceProjectId).ToList();
 
             var fileIdMap = new Dictionary<int, int>();
             foreach (var sourceFile in sourceFiles)
             {
-                var copiedPath = await CopyStoredObjectAsync(sourceFile.Path, userId, copied.Id, sourceFile.Name, sourceFile.ContentType);
-                deleteOnRollback.Add(copiedPath);
                 var fileId = State.NextFileId++;
-                var copiedFile = new FileItem(
-                    fileId,
-                    userId,
-                    copied.Id,
-                    sourceFile.Name,
-                    copiedPath,
-                    sourceFile.Size,
-                    sourceFile.Kind,
-                    sourceFile.ContentType,
-                    sourceFile.CreatedAt,
-                    $"/api/files/{fileId}/download");
-                State.Files.Add(copiedFile);
+                State.Files.Add(sourceFile with
+                {
+                    Id = fileId,
+                    ProjectId = copied.Id,
+                    Path = copiedPaths[sourceFile.Id],
+                    DownloadUrl = $"/api/files/{fileId}/download"
+                });
                 fileIdMap[sourceFile.Id] = fileId;
             }
 
             foreach (var sourceSet in State.AnnotationSets.Where(x => x.UserId == userId && fileIdMap.ContainsKey(x.FileId)).ToList())
             {
-                var nextFileId = fileIdMap[sourceSet.FileId];
-                var annotations = sourceSet.Annotations.Select(x => x with
-                {
-                    Bbox = x.Bbox with { },
-                    Segment = x.Segment is null ? null : x.Segment.ToList()
-                }).ToList();
+                var annotations = sourceSet.Annotations.Select(x => x with { Segment = x.Segment?.ToList() }).ToList();
                 State.AnnotationSets.Add(new AnnotationSet(
                     "annset_" + Util.Id(),
                     userId,
-                    nextFileId,
+                    fileIdMap[sourceSet.FileId],
                     sourceSet.Width,
                     sourceSet.Height,
                     annotations,
@@ -645,6 +634,14 @@ public sealed class MaskFlowStore
             ReplaceUser(currentUser with { UsedBytes = currentUser.UsedBytes + copiedBytes });
         });
         return copied;
+    }
+
+    static void EnsureStorageAvailable(User user, long additionalBytes)
+    {
+        if (user.UsedBytes + additionalBytes > user.QuotaBytes)
+        {
+            throw new BadHttpRequestException("Storage quota exceeded.", 403);
+        }
     }
 
     public async Task<bool> DeleteProjectAsync(int userId, string projectId)
@@ -671,7 +668,6 @@ public sealed class MaskFlowStore
             }
 
             State.Exports.RemoveAll(x => x.UserId == userId && x.ProjectId == projectId);
-            MarkProjectLabelsDirty(projectId);
             State.ProjectLabels.Remove(projectId);
             State.Projects.Remove(project);
             deleted = true;
@@ -791,7 +787,6 @@ public sealed class MaskFlowStore
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         State.ProjectLabels[projectId] = cleaned;
-        MarkProjectLabelsDirty(projectId);
         return cleaned;
     }
 
@@ -1088,93 +1083,22 @@ public sealed class MaskFlowStore
             .Where(x => NormalizeDataType(dataType) != "segmentation" || HasValidSegment(x))
             .Select(annotation => BuildYoloLine(annotation, dataType)));
 
+    // The archive is built from the committed snapshot without holding the write lock;
+    // only registering the finished export is serialized.
     public async Task<DatasetExport> CreateDatasetExportAsync(int userId, ExportRequest request)
     {
         var split = request.Split ?? new SplitConfig(70, 20, 10);
         DatasetSplitter.Validate(split);
+        var plan = DatasetExportPlan.Create(State, userId, request);
+        plan.ValidateExport();
 
-        DatasetExport? export = null;
-        await SaveAsync(async () =>
+        var exportId = "export_" + Util.Id();
+        var exportDir = Path.Combine(StorageRoot, userId.ToString(), "exports");
+        Directory.CreateDirectory(exportDir);
+        var zipPath = Path.Combine(exportDir, $"{exportId}.zip");
+        try
         {
-            var plan = DatasetExportPlan.Create(State, userId, request);
-            plan.ValidateExport();
-            var exportId = "export_" + Util.Id();
-            var exportDir = Path.Combine(StorageRoot, userId.ToString(), "exports");
-            Directory.CreateDirectory(exportDir);
-            var zipPath = Path.Combine(exportDir, $"{exportId}.zip");
-            deleteOnRollback.Add(zipPath);
-            var annotationMap = plan.Annotations;
-            var labeledFiles = plan.Files;
-            var exportFormat = plan.Format;
-            var exportDataType = plan.DataType;
-            var yoloTask = ResolveYoloTask(exportDataType);
-
-            using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
-            {
-                var labels = plan.Labels;
-                var samples = plan.Samples;
-                var assignments = DatasetSplitter.Assign(samples, split, request.Seed);
-
-                if (exportFormat == "classification-crops")
-                {
-                    await WriteClassificationCropDatasetAsync(archive, labeledFiles, annotationMap, labels, assignments);
-                }
-                else
-                {
-                    for (var index = 0; index < labeledFiles.Count; index++)
-                    {
-                        var file = labeledFiles[index];
-                        var targetSplit = assignments[file.Id];
-                        var extension = Path.GetExtension(file.Name);
-                        var stem = SanitizeFileName($"{file.Id}_{Path.GetFileNameWithoutExtension(file.Name)}");
-                        var imageEntry = archive.CreateEntry($"images/{targetSplit}/{stem}{extension}");
-                        await using (var imageEntryStream = imageEntry.Open())
-                        await using (var imageStream = await OpenStoredObjectAsync(file.Path))
-                        {
-                            await imageStream.CopyToAsync(imageEntryStream);
-                        }
-
-                        var labelEntry = archive.CreateEntry($"labels/{targetSplit}/{stem}.txt");
-                        using var labelWriter = new StreamWriter(labelEntry.Open());
-                        labelWriter.Write(BuildYoloTxt(annotationMap[file.Id].Annotations, exportDataType));
-                    }
-
-                    var dataEntry = archive.CreateEntry("data.yaml");
-                    using (var writer = new StreamWriter(dataEntry.Open()))
-                    {
-                        writer.WriteLine("path: .");
-                        writer.WriteLine($"task: {yoloTask}");
-                        writer.WriteLine("train: images/train");
-                        writer.WriteLine("val: images/val");
-                        writer.WriteLine("test: images/test");
-                        writer.WriteLine($"nc: {labels.Count}");
-                        writer.WriteLine("names:");
-                        for (var i = 0; i < labels.Count; i++)
-                        {
-                            writer.WriteLine($"  {i}: {JsonSerializer.Serialize(labels[i])}");
-                        }
-                    }
-                }
-
-                var reportEntry = archive.CreateEntry("split-report.json");
-                await using (var reportStream = reportEntry.Open())
-                    await JsonSerializer.SerializeAsync(reportStream,
-                        DatasetSplitter.Report(samples, labels, assignments, split, request.Seed),
-                        new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true });
-
-                var readme = archive.CreateEntry("README.md");
-                using var readmeWriter = new StreamWriter(readme.Open());
-                readmeWriter.WriteLine(exportFormat == "classification-crops" ? "# MaskFlow Classification Crop Dataset" : "# MaskFlow YOLO Dataset");
-                readmeWriter.WriteLine();
-                readmeWriter.WriteLine($"Format: {exportFormat}");
-                readmeWriter.WriteLine($"Task: {(exportFormat == "classification-crops" ? "classify" : yoloTask)}");
-                readmeWriter.WriteLine($"DataType: {exportDataType}");
-                readmeWriter.WriteLine($"Images: {labeledFiles.Count}");
-                readmeWriter.WriteLine($"Split: stratified by label, grouped by source image; seed={request.Seed}");
-                readmeWriter.WriteLine("See split-report.json for actual per-class image/annotation counts, file assignments and coverage warnings.");
-                readmeWriter.WriteLine($"GeneratedAt: {DateTimeOffset.UtcNow:O}");
-            }
-
+            await WriteDatasetArchiveAsync(zipPath, plan, split, request.Seed);
             var zipSize = new FileInfo(zipPath).Length;
             var exportPath = zipPath;
             if (UseMinio)
@@ -1190,15 +1114,100 @@ public sealed class MaskFlowStore
                         ContentType = "application/zip"
                     });
                 }
+
                 exportPath = $"minio://{MinioBucket}/{exportKey}";
-                deleteOnRollback.Add(exportPath);
                 File.Delete(zipPath);
             }
 
-            export = new DatasetExport(exportId, userId, request.ProjectId, request.TaskId, "completed", exportPath, zipSize, request with { Format = exportFormat, Split = split }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, $"/api/export/{exportId}/download");
-            State.Exports.Add(export);
-        });
-        return export!;
+            var export = new DatasetExport(exportId, userId, request.ProjectId, request.TaskId, "completed", exportPath, zipSize, request with { Format = plan.Format, Split = split }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null, $"/api/export/{exportId}/download");
+            await SaveAsync(() =>
+            {
+                deleteOnRollback.Add(exportPath);
+                State.Exports.Add(export);
+            });
+            return export;
+        }
+        catch
+        {
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+            throw;
+        }
+    }
+
+    async Task WriteDatasetArchiveAsync(string zipPath, DatasetExportPlan plan, SplitConfig split, int seed)
+    {
+        var annotationMap = plan.Annotations;
+        var labeledFiles = plan.Files;
+        var exportFormat = plan.Format;
+        var exportDataType = plan.DataType;
+        var yoloTask = ResolveYoloTask(exportDataType);
+
+        using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        {
+            var labels = plan.Labels;
+            var samples = plan.Samples;
+            var assignments = DatasetSplitter.Assign(samples, split, seed);
+
+            if (exportFormat == "classification-crops")
+            {
+                await WriteClassificationCropDatasetAsync(archive, labeledFiles, annotationMap, labels, assignments);
+            }
+            else
+            {
+                for (var index = 0; index < labeledFiles.Count; index++)
+                {
+                    var file = labeledFiles[index];
+                    var targetSplit = assignments[file.Id];
+                    var extension = Path.GetExtension(file.Name);
+                    var stem = SanitizeFileName($"{file.Id}_{Path.GetFileNameWithoutExtension(file.Name)}");
+                    var imageEntry = archive.CreateEntry($"images/{targetSplit}/{stem}{extension}");
+                    await using (var imageEntryStream = imageEntry.Open())
+                    await using (var imageStream = await OpenStoredObjectAsync(file.Path))
+                    {
+                        await imageStream.CopyToAsync(imageEntryStream);
+                    }
+
+                    var labelEntry = archive.CreateEntry($"labels/{targetSplit}/{stem}.txt");
+                    using var labelWriter = new StreamWriter(labelEntry.Open());
+                    labelWriter.Write(BuildYoloTxt(annotationMap[file.Id].Annotations, exportDataType));
+                }
+
+                var dataEntry = archive.CreateEntry("data.yaml");
+                using (var writer = new StreamWriter(dataEntry.Open()))
+                {
+                    writer.WriteLine("path: .");
+                    writer.WriteLine($"task: {yoloTask}");
+                    writer.WriteLine("train: images/train");
+                    writer.WriteLine("val: images/val");
+                    writer.WriteLine("test: images/test");
+                    writer.WriteLine($"nc: {labels.Count}");
+                    writer.WriteLine("names:");
+                    for (var i = 0; i < labels.Count; i++)
+                    {
+                        writer.WriteLine($"  {i}: {JsonSerializer.Serialize(labels[i])}");
+                    }
+                }
+            }
+
+            var reportEntry = archive.CreateEntry("split-report.json");
+            await using (var reportStream = reportEntry.Open())
+                await JsonSerializer.SerializeAsync(reportStream,
+                    DatasetSplitter.Report(samples, labels, assignments, split, seed),
+                    new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true });
+
+            var readme = archive.CreateEntry("README.md");
+            using var readmeWriter = new StreamWriter(readme.Open());
+            readmeWriter.WriteLine(exportFormat == "classification-crops" ? "# MaskFlow Classification Crop Dataset" : "# MaskFlow YOLO Dataset");
+            readmeWriter.WriteLine();
+            readmeWriter.WriteLine($"Format: {exportFormat}");
+            readmeWriter.WriteLine($"Task: {(exportFormat == "classification-crops" ? "classify" : yoloTask)}");
+            readmeWriter.WriteLine($"DataType: {exportDataType}");
+            readmeWriter.WriteLine($"Images: {labeledFiles.Count}");
+            readmeWriter.WriteLine($"Split: stratified by label, grouped by source image; seed={seed}");
+            readmeWriter.WriteLine("See split-report.json for actual per-class image/annotation counts, file assignments and coverage warnings.");
+            readmeWriter.WriteLine($"GeneratedAt: {DateTimeOffset.UtcNow:O}");
+        }
+
     }
 
     async Task WriteClassificationCropDatasetAsync(
@@ -1470,14 +1479,16 @@ public sealed class MaskFlowStore
     };
 
     // Tasks are tracked as platform jobs; keep the job record in step so it never lingers as "queued".
-    void SyncJobWithTask(TaskItem task)
+    void SyncJobWithTask(TaskItem task) => SyncJobWithTask(State, task);
+
+    static void SyncJobWithTask(MaskFlowState state, TaskItem task)
     {
-        var job = State.Jobs.FirstOrDefault(x => x.Id == task.JobId);
+        var job = state.Jobs.FirstOrDefault(x => x.Id == task.JobId);
         if (job is null) return;
         var status = JobStatusForTask(task.Status);
         if (job.Status == status) return;
-        State.Jobs.Remove(job);
-        State.Jobs.Add(job with
+        state.Jobs.Remove(job);
+        state.Jobs.Add(job with
         {
             Status = status,
             Error = task.ErrorMessage,
@@ -1486,11 +1497,11 @@ public sealed class MaskFlowStore
         });
     }
 
-    void SyncTaskJobStatuses()
+    static void SyncTaskJobStatuses(MaskFlowState state)
     {
-        foreach (var task in State.Tasks.ToList())
+        foreach (var task in state.Tasks.ToList())
         {
-            SyncJobWithTask(task);
+            SyncJobWithTask(state, task);
         }
     }
 
@@ -1502,16 +1513,34 @@ public sealed class MaskFlowStore
         return job;
     }
 
+    // Only a SHA-256 of the session token is stored, so a database leak does not leak live sessions.
     string CreateSession(int userId, string? deviceId = null)
     {
         var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-        State.Sessions.Add(new Session(token, userId, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddDays(7), deviceId));
+        State.Sessions.Add(new Session(Util.Sha256(token), userId, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddDays(7), deviceId));
         return token;
     }
 
     void InvalidateSessions(int userId, string? keepSessionToken = null)
     {
-        State.Sessions.RemoveAll(x => x.UserId == userId && x.Token != keepSessionToken);
+        var keepHash = keepSessionToken is null ? null : Util.Sha256(keepSessionToken);
+        State.Sessions.RemoveAll(x => x.UserId == userId && x.Token != keepHash);
+    }
+
+    static bool IsSha256Hex(string value) =>
+        value.Length == 64 && value.All(ch => ch is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    // Sessions written before hashing was introduced stored the raw token; hash them in place.
+    static void HashLegacySessionTokens(MaskFlowState state)
+    {
+        for (var i = 0; i < state.Sessions.Count; i++)
+        {
+            var session = state.Sessions[i];
+            if (!IsSha256Hex(session.Token))
+            {
+                state.Sessions[i] = session with { Token = Util.Sha256(session.Token) };
+            }
+        }
     }
 
     void InvalidateSessionsForDevice(int userId, string deviceId)
@@ -1537,16 +1566,16 @@ public sealed class MaskFlowStore
         return string.IsNullOrWhiteSpace(token) ? null : token;
     }
 
-    void Seed()
+    static void Seed(MaskFlowState state)
     {
-        if (State.Pools.Count == 0)
+        if (state.Pools.Count == 0)
         {
-            State.Pools.Add(new Pool("platform-gpu", "Platform GPU Pool", "platform-gpu", "cn-east", "active", new() { ["gpu"] = 8, ["vramGb"] = 192 }, new() { ["priority"] = "balanced" }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
-            State.Pools.Add(new Pool("cpu-general", "General CPU Pool", "cpu-general", "cn-east", "active", new() { ["cpu"] = 64, ["memoryGb"] = 256 }, new() { ["priority"] = "low" }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+            state.Pools.Add(new Pool("platform-gpu", "Platform GPU Pool", "platform-gpu", "cn-east", "active", new() { ["gpu"] = 8, ["vramGb"] = 192 }, new() { ["priority"] = "balanced" }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+            state.Pools.Add(new Pool("cpu-general", "General CPU Pool", "cpu-general", "cn-east", "active", new() { ["cpu"] = 64, ["memoryGb"] = 256 }, new() { ["priority"] = "low" }, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
         }
-        if (State.PricingRules.Count == 0)
+        if (state.PricingRules.Count == 0)
         {
-            State.PricingRules.Add(new PricingRule("price_gpu_default", "Default GPU Pricing", "gpu", "platform-gpu", "cn-east", 2.8, "hour", "active", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+            state.PricingRules.Add(new PricingRule("price_gpu_default", "Default GPU Pricing", "gpu", "platform-gpu", "cn-east", 2.8, "hour", "active", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
         }
     }
 
