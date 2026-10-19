@@ -28,6 +28,7 @@
 - **Dataset import** — upload a zip or a single annotation file; YOLO, COCO, LabelMe and VOC are detected automatically and matched to images by file name.
 - **Team collaboration** — invite members per project (reviewer / annotator / viewer), assign images, and run a submit → approve / reject review flow; invitations, password resets and task notices go out by email.
 - **Video annotation** — upload a video to extract frames, label one frame, and let SAM propagate the boxes frame by frame with their classes.
+- **One-stop model training**: pick a pre-downloaded base weight (detect / segment / classify), train on the project's annotations, evaluate (val/test mAP, per-class metrics, confusion matrix) and export `best.pt` / ONNX; the trained model is registered for auto-annotation.
 - **Task tracking** — processing history, AI usage quotas, and project-level statistics.
 - **Self-hosted deployment** — Docker Compose runs the Vue frontend, .NET API, FastAPI inference service, MySQL, and MinIO.
 

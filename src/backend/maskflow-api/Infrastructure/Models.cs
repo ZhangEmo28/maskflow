@@ -27,6 +27,7 @@ public record MaskFlowState
     public List<ProjectInvite> ProjectInvites { get; set; } = [];
     public List<FileAssignment> FileAssignments { get; set; } = [];
     public List<VideoItem> Videos { get; set; } = [];
+    public List<TrainingRun> TrainingRuns { get; set; } = [];
     public Dictionary<string, List<string>> ProjectLabels { get; set; } = [];
     // projectId -> label -> SAM 3 text prompt (labels without an entry use the label itself)
     public Dictionary<string, Dictionary<string, string>> ProjectLabelPrompts { get; set; } = [];
@@ -90,6 +91,13 @@ public record ReviewRequest(string? Comment);
 public record VideoItem(string Id, int UserId, string ProjectId, string Name, string Path, long Size, double Fps, double DurationSec, double EverySeconds,
     List<int> FrameFileIds, List<int> FrameIndexes, string Status, string? Error, DateTimeOffset CreatedAt);
 public record PropagateRequest(int Count = 10);
+public record TrainingRequest(string BaseWeight, int Epochs = 50, int ImageSize = 640, int Batch = 16, int Patience = 20,
+    SplitConfig? Split = null, bool ConfirmedOnly = false, int Seed = 42, string? Name = null);
+public record TrainingArtifact(string Name, string Path, long Size);
+// Status: queued → preparing (dataset upload) → training → evaluating → exporting → completed | failed | cancelled.
+public record TrainingRun(string Id, int UserId, string ProjectId, int CreatedBy, string Name, string Task, string Format, TrainingRequest Request,
+    string Status, int Epoch, List<Dictionary<string, double>> History, JsonElement? Metrics, List<TrainingArtifact> Artifacts, string? ModelId,
+    int ImageCount, string? Error, DateTimeOffset CreatedAt, DateTimeOffset? StartedAt, DateTimeOffset? FinishedAt);
 public record AnnotationItem(string Id, int ClassId, string? Label, YoloBox Bbox, List<double>? Segment, double Confidence, bool Confirmed = false);
 public record YoloBox(double Cx, double Cy, double Width, double Height);
 public record TaskItem(string Id, int UserId, string JobId, string Type, string? Title, string? ProjectId, int? FileId, int ImageCount, string Status, double Progress, Dictionary<string, object?>? Result, string? ErrorMessage, DateTimeOffset CreatedAt, DateTimeOffset? StartedAt, DateTimeOffset? FinishedAt);

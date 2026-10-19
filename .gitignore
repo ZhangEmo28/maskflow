@@ -26,3 +26,5 @@ data/
 
 # Local runtime artifacts
 src/backend/maskflow-api/run-*.log
+资源/训练权重/*
+!资源/训练权重/README.md
