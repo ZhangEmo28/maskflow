@@ -71,6 +71,8 @@ public static class StateDiff
         FileAssignments = [.. state.FileAssignments],
         Videos = [.. state.Videos],
         TrainingRuns = [.. state.TrainingRuns],
+        OAuthClients = [.. state.OAuthClients],
+        OAuthGrants = [.. state.OAuthGrants],
         ProjectLabels = new(state.ProjectLabels),
         ProjectLabelPrompts = new(state.ProjectLabelPrompts),
         Quotas = new(state.Quotas),

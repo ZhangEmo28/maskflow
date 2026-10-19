@@ -9,6 +9,7 @@ import FilesPage from "./components/pages/FilesPage.vue";
 import RecordsPage from "./components/pages/RecordsPage.vue";
 import ExportPage from "./components/pages/ExportPage.vue";
 import TrainPage from "./components/pages/TrainPage.vue";
+import OAuthPage from "./components/pages/OAuthPage.vue";
 import BillingPage from "./components/pages/BillingPage.vue";
 import SettingsPage from "./components/pages/SettingsPage.vue";
 
@@ -53,7 +54,7 @@ const {
     </div>
   </header>
 
-  <template v-else>
+  <template v-else-if="page !== 'oauth'">
     <header class="mf-topbar">
       <a class="marketing-brand" href="#" @click.prevent="go('/dashboard.html')"><span class="logo-mark">M</span><strong>MaskFlow</strong></a>
       <nav class="mf-nav">
@@ -72,7 +73,7 @@ const {
     </header>
   </template>
 
-  <aside v-if="!['home', 'auth'].includes(page)" class="app-sidebar">
+  <aside v-if="!['home', 'auth', 'oauth'].includes(page)" class="app-sidebar">
     <a class="app-sidebar-brand" href="#" @click.prevent="go('/dashboard.html')"><span class="logo-mark">M</span><strong>MaskFlow</strong></a>
     <nav>
       <a :class="{ active: page === 'dashboard' }" href="#" @click.prevent="go('/dashboard.html')"><span>D</span>控制台</a>
@@ -102,6 +103,7 @@ const {
   <RecordsPage v-if="page === 'records'" />
   <ExportPage v-if="page === 'export'" />
   <TrainPage v-if="page === 'train'" />
+  <OAuthPage v-if="page === 'oauth' && account" />
   <BillingPage v-if="page === 'billing'" />
   <SettingsPage v-if="page === 'settings'" />
 </template>

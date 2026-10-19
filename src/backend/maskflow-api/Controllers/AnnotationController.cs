@@ -90,30 +90,7 @@ public sealed class AnnotationController : ControllerBase
     {
         var user = store.RequireUser(HttpContext);
         var access = store.RequireProjectAccess(user.Id, request.ProjectId, Permissions.Edit);
-        var ownerId = access.OwnerId;
-        var project = access.Project;
-        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
-
-        var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
-        var files = store.State.Files
-            .Where(x => x.UserId == ownerId && x.ProjectId == project.Id && x.Kind == "image")
-            .OrderBy(x => x.Id)
-            .ToList();
-        if (files.Count == 0) return BadRequest(new { detail = "项目中还没有图片。" });
-        annotator.Validate(ownerId, files[0], options);
-
-        var annotated = store.State.AnnotationSets.Where(x => x.UserId == ownerId).Select(x => x.FileId).ToHashSet();
-        var fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id)))
-            .Select(x => x.Id)
-            .ToList();
-        if (fileIds.Count == 0) return BadRequest(new { detail = "没有需要处理的图片：所有图片都已有标注。" });
-
-        var active = store.State.Tasks.Any(x => x.UserId == ownerId && x.ProjectId == project.Id
-            && x.Type == MaskFlowStore.BatchAnnotationTaskType && x.Status is "queued" or "running");
-        if (active) return Conflict(new { detail = "该项目已有正在进行的批量标注任务。" });
-
-        var task = await store.CreateBatchAnnotationTaskAsync(ownerId, request with { Mode = options.Mode }, fileIds);
-        worker.Wake();
+        var task = await worker.QueueAsync(access, request);
         return Ok(new { task });
     }
 

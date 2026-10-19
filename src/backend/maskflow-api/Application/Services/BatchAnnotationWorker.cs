@@ -16,6 +16,32 @@ public sealed class BatchAnnotationWorker(
         if (wake.CurrentCount == 0) wake.Release();
     }
 
+    // Validates and queues a batch for the project; scope "unannotated" (default) or "all".
+    public async Task<TaskItem> QueueAsync(ProjectAccess access, AnnotationBatchRequest request)
+    {
+        var ownerId = access.OwnerId;
+        store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
+        var options = AutoAnnotationOptions.Create(request.Mode, request.Conf, request.DefaultLabel, request.ModelId);
+        var files = store.State.Files
+            .Where(x => x.UserId == ownerId && x.ProjectId == access.Project.Id && x.Kind == "image")
+            .OrderBy(x => x.Id)
+            .ToList();
+        if (files.Count == 0) throw new BadHttpRequestException("项目中还没有图片。", 400);
+        annotator.Validate(ownerId, files[0], options);
+
+        var annotated = store.State.AnnotationSets.Where(x => x.UserId == ownerId).Select(x => x.FileId).ToHashSet();
+        var fileIds = (request.Scope == "all" ? files : files.Where(x => !annotated.Contains(x.Id))).Select(x => x.Id).ToList();
+        if (fileIds.Count == 0) throw new BadHttpRequestException("没有需要处理的图片：所有图片都已有标注。", 400);
+
+        var active = store.State.Tasks.Any(x => x.UserId == ownerId && x.ProjectId == access.Project.Id
+            && x.Type == MaskFlowStore.BatchAnnotationTaskType && x.Status is "queued" or "running");
+        if (active) throw new BadHttpRequestException("该项目已有正在进行的批量标注任务。", 409);
+
+        var task = await store.CreateBatchAnnotationTaskAsync(ownerId, request with { Mode = options.Mode }, fileIds);
+        Wake();
+        return task;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)

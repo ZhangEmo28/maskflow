@@ -64,6 +64,7 @@ builder.Services.Configure<FormOptions>(options =>
 });
 
 builder.Services.AddMaskFlowApplication();
+builder.Services.AddMaskFlowMcp();
 builder.Services.AddMaskFlowInfrastructure();
 builder.Services.AddControllers(options =>
 {
@@ -119,6 +120,8 @@ var store = app.Services.GetRequiredService<MaskFlowStore>();
 store.Initialize();
 
 app.MapControllers();
+app.MapMaskFlowMcp();
+app.MapMaskFlowOAuth();
 
 app.Run();
 

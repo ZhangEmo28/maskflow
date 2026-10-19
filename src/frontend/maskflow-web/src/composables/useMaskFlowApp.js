@@ -54,6 +54,7 @@ export function useMaskFlowApp() {
     "/annotate.html": "annotate",
     "/export.html": "export",
     "/train.html": "train",
+    "/oauth.html": "oauth",
     "/files.html": "files",
     "/records.html": "records",
     "/billing.html": "billing",
@@ -196,6 +197,7 @@ export function useMaskFlowApp() {
     tokenName: "",
     tokenValue: "",
     tokens: [],
+    grants: [],
     teamEmail: "",
     teamRole: "member",
     members: [],
@@ -206,6 +208,7 @@ export function useMaskFlowApp() {
     ["password", "修改密码"],
     ["notifications", "通知设置"],
     ["tokens", "API Token"],
+    ["agents", "智能体连接"],
     ["team", "团队管理"],
     ["devices", "设备管理"]
   ];
@@ -292,7 +295,7 @@ export function useMaskFlowApp() {
       account.value = data.user;
       if (await acceptPendingInvite()) return;
       const redirect = new URLSearchParams(location.search).get("redirect");
-      go(redirect && redirect.startsWith("/") ? redirect : "/dashboard.html");
+      go(redirect && redirect.startsWith("/") && !redirect.startsWith("//") ? redirect : "/dashboard.html");
     } catch (error) {
       message.value = error.message;
     } finally {
@@ -2949,16 +2952,25 @@ export function useMaskFlowApp() {
     if (!account.value) return;
     settings.username = account.value.username || "";
     settings.phone = account.value.phone || "";
-    const [notifications, tokens, team, devices] = await Promise.all([
+    const [notifications, tokens, team, devices, grants] = await Promise.all([
       apiFetch("/api/account/notifications").catch(() => ({ settings: settings.notifications })),
       apiFetch("/api/account/api-tokens").catch(() => ({ tokens: [] })),
       apiFetch("/api/account/team").catch(() => ({ members: [] })),
-      apiFetch("/api/account/devices").catch(() => ({ devices: [] }))
+      apiFetch("/api/account/devices").catch(() => ({ devices: [] })),
+      apiFetch("/api/account/oauth-grants").catch(() => ({ grants: [] }))
     ]);
+    settings.grants = grants.grants || [];
     settings.notifications = { ...settings.notifications, ...(notifications.settings || {}) };
     settings.tokens = tokens.tokens || [];
     settings.members = team.members || [];
     settings.devices = devices.devices || [];
+  }
+
+  async function revokeOAuthGrant(grant) {
+    if (!window.confirm(`断开「${grant.clientName}」？它将不能再访问你的账户。`)) return;
+    await apiFetch(`/api/account/oauth-grants/${grant.id}`, { method: "DELETE" });
+    await loadAccountSettings();
+    message.value = "已断开连接";
   }
 
   async function saveNotifications() {
@@ -3021,7 +3033,11 @@ export function useMaskFlowApp() {
       syncExportSplitFromProject();
       refreshExports();
     }
-    if (page.value === "settings" && account.value) loadAccountSettings();
+    if (page.value === "settings" && account.value) {
+      const tab = new URLSearchParams(window.location.search).get("tab");
+      if (settingsTabs.some(([key]) => key === tab)) settings.active = tab;
+      loadAccountSettings();
+    }
     if (page.value === "train") refreshProjects().then(trainingApi.refreshTraining);
     else trainingApi.stopTrainingPoll();
   }
@@ -3036,7 +3052,7 @@ export function useMaskFlowApp() {
     window.addEventListener("keydown", handleAnnotateKeydown);
     window.addEventListener("keyup", handleAnnotateKeyup);
     window.addEventListener("blur", () => { annotate.spaceHeld = false; });
-    if (needsLogin(page.value) && !session()) go("/auth.html");
+    if (needsLogin(page.value) && !session()) go(`/auth.html?redirect=${encodeURIComponent(path.value + window.location.search)}`);
     account.value = currentUser();
     if (inviteFromUrl && account.value) {
       acceptPendingInvite();
@@ -3077,7 +3093,7 @@ export function useMaskFlowApp() {
     previewUrl, downloadCurrentTxt, selectProject, createProject, copyCurrentProject, deleteFile, deleteCurrentProject,
     createExport, exportSplitTotal, validExportConfig, refreshExportAnalysis, applyRecommendedSplit, downloadExportItem, formatDateTime, needsLogin, uploadFiles,
     runSegment, selectSegmentFile, showSegmentOverlay, subscribe, saveSettings, changePassword,
-    saveNotifications, createApiToken, revokeApiToken, addTeamMember, removeTeamMember, revokeDevice,
+    saveNotifications, createApiToken, revokeApiToken, revokeOAuthGrant, addTeamMember, removeTeamMember, revokeDevice,
     refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload, importer, importDataset, downloadFileItem,
     ...trainingApi
   };

@@ -10,6 +10,23 @@ const changePassword = inject("changePassword");
 const saveNotifications = inject("saveNotifications");
 const createApiToken = inject("createApiToken");
 const revokeApiToken = inject("revokeApiToken");
+const revokeOAuthGrant = inject("revokeOAuthGrant");
+const formatDateTime = inject("formatDateTime");
+const mcpUrl = `${window.location.origin}/mcp`;
+const isPublicHttps = window.location.protocol === "https:" && !["localhost", "127.0.0.1"].includes(window.location.hostname);
+const clientSnippets = [
+  ["Claude Code", `claude mcp add --transport http maskflow ${mcpUrl} --header "Authorization: Bearer <API Token>"`],
+  ["Cursor / Windsurf / 其他支持 HTTP 的客户端（mcp.json）", JSON.stringify({ mcpServers: { maskflow: { url: mcpUrl, headers: { Authorization: "Bearer <API Token>" } } } }, null, 2)]
+];
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    message.value = "已复制";
+  } catch {
+    message.value = "复制失败，请手动选择文本复制";
+  }
+}
 const addTeamMember = inject("addTeamMember");
 const removeTeamMember = inject("removeTeamMember");
 const revokeDevice = inject("revokeDevice");
@@ -66,6 +83,46 @@ const revokeDevice = inject("revokeDevice");
               <td><button class="text-danger" @click="revokeApiToken(token.id)">撤销</button></td>
             </tr>
             <tr v-if="!settings.tokens.length"><td colspan="5">还没有 API Token。</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section v-if="settings.active === 'agents'" class="account-settings-card agents-card">
+        <div class="settings-card-title"><h2>智能体连接（MCP）</h2><p>让 Claude、ChatGPT 等智能体通过 MCP 协议操作 MaskFlow：在对话里说需求，它就能帮你标注、检查质量、训练和评估模型。</p></div>
+        <div class="mcp-url">
+          <span>MCP 地址</span>
+          <code>{{ mcpUrl }}</code>
+          <button class="btn secondary compact-btn" type="button" @click="copyText(mcpUrl)">复制</button>
+        </div>
+        <div class="agent-guides">
+          <article>
+            <h3>ChatGPT / Claude 网页版与桌面版（OAuth 登录）</h3>
+            <ol>
+              <li>Claude：设置 → 连接器（Connectors）→ 添加自定义连接器；ChatGPT：设置 → 连接器 → 开发者模式下创建连接器。</li>
+              <li>填入上面的 MCP 地址，认证方式选 OAuth，保存后会跳到 MaskFlow 授权页，点「允许访问」即可。</li>
+            </ol>
+            <p v-if="!isPublicHttps" class="agent-warning">当前地址不是公网 HTTPS。ChatGPT 和 Claude 网页版从云端连接，需要把 MaskFlow 部署在公网 HTTPS 域名下，并设置 <code>MASKFLOW_PUBLIC_URL</code> 为该域名。</p>
+          </article>
+          <article>
+            <h3>本地客户端（API Token）</h3>
+            <p>先在「API Token」中创建一个 Token，替换下面的 <code>&lt;API Token&gt;</code>。本机或内网部署也可以直接用。</p>
+            <div v-for="[title, snippet] in clientSnippets" :key="title" class="agent-snippet">
+              <div><strong>{{ title }}</strong><button class="text-link" type="button" @click="copyText(snippet)">复制</button></div>
+              <pre>{{ snippet }}</pre>
+            </div>
+          </article>
+        </div>
+        <h3 class="agents-subtitle">已连接的应用</h3>
+        <table class="settings-table">
+          <thead><tr><th>应用</th><th>回调地址</th><th>授权时间</th><th>有效期至</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="grant in settings.grants" :key="grant.id">
+              <td>{{ grant.clientName }}</td>
+              <td>{{ grant.redirectHost }}</td>
+              <td>{{ formatDateTime(grant.createdAt) }}</td>
+              <td>{{ formatDateTime(grant.expiresAt) }}</td>
+              <td><button class="text-danger" @click="revokeOAuthGrant(grant)">断开</button></td>
+            </tr>
+            <tr v-if="!settings.grants.length"><td colspan="5">还没有通过 OAuth 连接的应用。用 API Token 连接的客户端在「API Token」中管理。</td></tr>
           </tbody>
         </table>
       </section>

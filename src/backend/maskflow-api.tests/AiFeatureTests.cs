@@ -18,7 +18,7 @@ public sealed class FakeEmailSender : IEmailSender
     }
 }
 
-sealed class FakeSam : HttpMessageHandler, IHttpClientFactory
+public sealed class FakeSam : HttpMessageHandler, IHttpClientFactory
 {
     readonly Func<HttpRequestMessage, string, (HttpStatusCode Status, string Body)> respond;
     public List<(string Method, string Path, string Body)> Calls { get; } = [];

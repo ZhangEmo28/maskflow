@@ -56,6 +56,9 @@ public class MySqlRepositoryIntegrationTests
                 Artifacts = [new TrainingArtifact("best.pt", "/tmp/it-best.pt", 10)], ModelId = model.Id
             });
 
+            var oauthClient = await store.RegisterOAuthClientAsync("Claude", ["https://claude.ai/api/mcp/auth_callback"]);
+            var (_, oauthAccess, _) = await store.CreateOAuthGrantAsync(oauthClient.Id, userId);
+
             var reloaded = new MaskFlowStore(new MySqlMaskFlowRepository(builder.ConnectionString));
             reloaded.Initialize();
             var state = reloaded.State;
@@ -78,6 +81,8 @@ public class MySqlRepositoryIntegrationTests
             Assert.Equal(0.31, MaskFlowStore.TrainingHeadline(training)["mAP50-95"]);
             Assert.Equal(("yolo11n-seg.pt", 20), (training.Request.BaseWeight, training.Request.Split!.Val));
             Assert.Equal("best.pt", Assert.Single(training.Artifacts).Name);
+            Assert.Equal(["https://claude.ai/api/mcp/auth_callback"], reloaded.GetOAuthClient(oauthClient.Id)!.RedirectUris);
+            Assert.Equal(userId, reloaded.UserForOAuthAccessToken(Util.Sha256(oauthAccess))?.Id);
             File.Delete(model.Path);
         }
         finally

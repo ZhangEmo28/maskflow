@@ -11,7 +11,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 namespace MaskFlow.Api.Tests;
 
 // Boots the real API (routing, filters, controllers) on an in-memory repository.
-public sealed class MaskFlowApp : WebApplicationFactory<Program>
+public class MaskFlowApp : WebApplicationFactory<Program>
 {
     public FakeRepository Repository { get; } = new();
     public FakeEmailSender Mail { get; } = new();
@@ -28,8 +28,12 @@ public sealed class MaskFlowApp : WebApplicationFactory<Program>
             services.AddSingleton(new MaskFlowStore(Repository, Storage));
             services.RemoveAll<IEmailSender>();
             services.AddSingleton<IEmailSender>(Mail);
+            ConfigureFakes(services);
         });
     }
+
+    // Subclasses swap in fake inference/training services.
+    protected virtual void ConfigureFakes(IServiceCollection services) { }
 
     public async Task<Client> SignUpAsync(string name)
     {

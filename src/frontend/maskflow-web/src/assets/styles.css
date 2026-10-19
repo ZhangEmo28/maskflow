@@ -7166,3 +7166,156 @@ body:has(.app-sidebar) {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- OAuth consent & agent connections ---- */
+.oauth-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.oauth-card {
+  width: min(520px, 100%);
+  padding: 32px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: var(--shadow);
+}
+
+.oauth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.oauth-card h1 {
+  margin: 0 0 10px;
+  font-size: 22px;
+}
+
+.oauth-card p,
+.oauth-scopes {
+  color: #334155;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.oauth-muted {
+  color: var(--muted) !important;
+}
+
+.oauth-error {
+  color: var(--red) !important;
+}
+
+.oauth-scopes {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.oauth-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.mcp-url {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #dbe5ff;
+  border-radius: 8px;
+  background: var(--blue-soft);
+}
+
+.mcp-url span {
+  color: #1e3a8a;
+  font-weight: 800;
+}
+
+.mcp-url code {
+  flex: 1;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.agent-guides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.agent-guides article {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.agent-guides h3,
+.agents-subtitle {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.agents-subtitle {
+  margin-top: 22px;
+}
+
+.agent-guides ol {
+  margin: 0;
+  padding-left: 18px;
+  color: #334155;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.agent-guides p {
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.agent-warning {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fff7ed;
+  color: #9a3412 !important;
+}
+
+.agent-snippet {
+  margin-top: 10px;
+}
+
+.agent-snippet > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.agent-snippet pre {
+  margin: 6px 0 0;
+  padding: 10px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.text-link {
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font-weight: 700;
+  cursor: pointer;
+}

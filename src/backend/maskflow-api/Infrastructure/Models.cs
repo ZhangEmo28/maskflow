@@ -28,6 +28,8 @@ public record MaskFlowState
     public List<FileAssignment> FileAssignments { get; set; } = [];
     public List<VideoItem> Videos { get; set; } = [];
     public List<TrainingRun> TrainingRuns { get; set; } = [];
+    public List<OAuthClient> OAuthClients { get; set; } = [];
+    public List<OAuthGrant> OAuthGrants { get; set; } = [];
     public Dictionary<string, List<string>> ProjectLabels { get; set; } = [];
     // projectId -> label -> SAM 3 text prompt (labels without an entry use the label itself)
     public Dictionary<string, Dictionary<string, string>> ProjectLabelPrompts { get; set; } = [];
@@ -93,6 +95,9 @@ public record VideoItem(string Id, int UserId, string ProjectId, string Name, st
 public record PropagateRequest(int Count = 10);
 public record TrainingRequest(string BaseWeight, int Epochs = 50, int ImageSize = 640, int Batch = 16, int Patience = 20,
     SplitConfig? Split = null, bool ConfirmedOnly = false, int Seed = 42, string? Name = null);
+public record OAuthClient(string Id, string Name, List<string> RedirectUris, DateTimeOffset CreatedAt);
+public record OAuthGrant(string Id, string ClientId, int UserId, string AccessTokenHash, DateTimeOffset AccessExpiresAt,
+    string RefreshTokenHash, DateTimeOffset RefreshExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset? RevokedAt);
 public record TrainingArtifact(string Name, string Path, long Size);
 // Status: queued → preparing (dataset upload) → training → evaluating → exporting → completed | failed | cancelled.
 public record TrainingRun(string Id, int UserId, string ProjectId, int CreatedBy, string Name, string Task, string Format, TrainingRequest Request,

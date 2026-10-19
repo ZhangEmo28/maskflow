@@ -80,6 +80,14 @@ public sealed class AutoAnnotationService(MaskFlowStore store, IHttpClientFactor
 
     public async Task<AnnotationSet> RunAsync(int userId, FileItem file, AutoAnnotationOptions options, bool recordTask, CancellationToken cancellationToken)
     {
+        var request = await PredictAsync(userId, file, options, cancellationToken);
+        var (set, _) = await store.PersistAutoAnnotationAsync(userId, request, file, recordTask: recordTask);
+        return set;
+    }
+
+    // Runs inference and returns the labelled result without saving it (model evaluation, previews).
+    public async Task<AnnotationSaveRequest> PredictAsync(int userId, FileItem file, AutoAnnotationOptions options, CancellationToken cancellationToken)
+    {
         var labels = Validate(userId, file, options);
         var client = clientFactory.CreateClient("sam");
         var conf = options.Conf.ToString(CultureInfo.InvariantCulture);
@@ -116,8 +124,7 @@ public sealed class AutoAnnotationService(MaskFlowStore store, IHttpClientFactor
             }
         }
 
-        var (set, _) = await store.PersistAutoAnnotationAsync(userId, request, file, recordTask: recordTask);
-        return set;
+        return request;
     }
 
     async Task<string> PostImageAsync(HttpClient client, string path, FileItem file, Dictionary<string, string> fields, CancellationToken cancellationToken)
