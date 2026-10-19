@@ -37,7 +37,7 @@
       </form>
 
       <form v-else-if="auth.mode === 'forgot'" class="auth-form" @submit.prevent="submitForgotPassword">
-        <p class="auth-help">输入注册邮箱，系统会生成重置码（当前部署为页面内回显，无需邮件）。</p>
+        <p class="auth-help">输入注册邮箱，系统会把重置码发送到该邮箱（30 分钟内有效）。</p>
         <div class="form-row"><label>邮箱</label><input v-model="auth.email" type="email" autocomplete="email" placeholder="name@example.com" required /></div>
         <p v-if="message" class="form-error">{{ message }}</p>
         <button class="auth-submit" type="submit" :disabled="loading">{{ loading ? '处理中...' : '获取重置码' }}</button>
@@ -45,7 +45,7 @@
       </form>
 
       <form v-else class="auth-form" @submit.prevent="submitResetPassword">
-        <p class="auth-help">输入重置码和新密码，完成后即可用新密码登录。</p>
+        <p class="auth-help">输入邮件中收到的重置码和新密码，完成后即可用新密码登录。</p>
         <div class="form-row"><label>邮箱</label><input v-model="auth.email" type="email" autocomplete="email" placeholder="name@example.com" required /></div>
         <div class="form-row"><label>重置码</label><input v-model="auth.resetToken" autocomplete="one-time-code" placeholder="粘贴或输入重置码" required /></div>
         <div class="form-row"><label>新密码</label><input v-model="auth.password" type="password" autocomplete="new-password" placeholder="至少 8 位" required minlength="8" /></div>

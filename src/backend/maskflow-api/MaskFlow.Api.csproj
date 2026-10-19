@@ -9,7 +9,8 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="4.0.103.3" />
     <PackageReference Include="MySqlConnector" Version="2.6.2" />
-    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="4.153.1" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
   </ItemGroup>
 

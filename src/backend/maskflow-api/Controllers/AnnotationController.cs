@@ -78,7 +78,7 @@ public sealed class AnnotationController : ControllerBase
                 };
             }
 
-            var saveRequest = BuildAnnotationSaveRequest(file.Id, body, request.DefaultLabel, projectLabels);
+            var saveRequest = AutoAnnotationParser.Parse(file.Id, body, request.DefaultLabel, projectLabels);
             var (set, _) = await store.PersistAutoAnnotationAsync(user.Id, saveRequest, file);
             return Ok(new { annotation = set, user = store.PublicUser(store.GetUser(user.Id)!) });
         }
@@ -268,58 +268,5 @@ public sealed class AnnotationController : ControllerBase
         {
             return StatusCode(504, new { detail = "SAM inference service request timed out." });
         }
-    }
-
-    private static AnnotationSaveRequest BuildAnnotationSaveRequest(
-        int fileId,
-        string body,
-        string? defaultLabel,
-        IReadOnlyList<string> projectLabels)
-    {
-        using var document = JsonDocument.Parse(body);
-        var root = document.RootElement;
-        var width = root.TryGetProperty("width", out var widthElement) ? widthElement.GetInt32() : 0;
-        var height = root.TryGetProperty("height", out var heightElement) ? heightElement.GetInt32() : 0;
-        var items = new List<AnnotationItem>();
-        var assignedLabel = string.IsNullOrWhiteSpace(defaultLabel) ? null : defaultLabel.Trim();
-        var classId = MaskFlowStore.ResolveLabelClassId(assignedLabel, projectLabels);
-        if (assignedLabel is not null && classId < 0)
-        {
-            assignedLabel = null;
-            classId = -1;
-        }
-
-        if (root.TryGetProperty("masks", out var masks) && masks.ValueKind == JsonValueKind.Array)
-        {
-            var index = 0;
-            foreach (var mask in masks.EnumerateArray())
-            {
-                if (!mask.TryGetProperty("yoloBox", out var box)) continue;
-                var segment = new List<double>();
-                if (mask.TryGetProperty("yoloSegments", out var segments) && segments.ValueKind == JsonValueKind.Array)
-                {
-                    var first = segments.EnumerateArray().FirstOrDefault();
-                    if (first.ValueKind == JsonValueKind.Array)
-                    {
-                        segment = first.EnumerateArray().Select(x => x.GetDouble()).ToList();
-                    }
-                }
-
-                items.Add(new AnnotationItem(
-                    mask.TryGetProperty("id", out var id) ? id.GetString() ?? $"ann_{index}" : $"ann_{index}",
-                    classId,
-                    assignedLabel,
-                    new YoloBox(
-                        box.TryGetProperty("cx", out var cx) ? cx.GetDouble() : 0,
-                        box.TryGetProperty("cy", out var cy) ? cy.GetDouble() : 0,
-                        box.TryGetProperty("width", out var bw) ? bw.GetDouble() : 0,
-                        box.TryGetProperty("height", out var bh) ? bh.GetDouble() : 0),
-                    segment.Count > 0 ? segment : null,
-                    1.0));
-                index++;
-            }
-        }
-
-        return new AnnotationSaveRequest(fileId, width, height, items);
     }
 }

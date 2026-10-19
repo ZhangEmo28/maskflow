@@ -594,13 +594,12 @@ def _mask_to_geometry(mask: np.ndarray, width: int, height: int) -> dict[str, An
     x2 = int(np.ceil(max([mask_x2, *xs])))
     y2 = int(np.ceil(max([mask_y2, *ys])))
 
-    # The browser draws mask outlines with stroke width, so keep a visible margin
-    # around the true mask geometry instead of returning a just-touching box.
-    pad = max(8, int(round(max(width, height) * 0.012)))
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(width - 1, x2 + pad)
-    y2 = min(height - 1, y2 + pad)
+    # Boxes are training labels: keep them tight to the mask. Any visual margin for
+    # stroke width belongs to the frontend renderer, not to the exported geometry.
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(width - 1, x2)
+    y2 = min(height - 1, y2)
     return {
         "box": {
             "x": x1,
@@ -694,7 +693,7 @@ async def segment(
         raise HTTPException(status_code=400, detail="Confidence must be between 0.01 and 0.95.")
 
     content = await image.read()
-    temp_path, pil_image = _image_to_temp_file(image, content)
+    temp_path, pil_image = await run_in_threadpool(_image_to_temp_file, image, content)
 
     try:
         result = await run_in_threadpool(_run_segmentation, temp_path, pil_image, prompt, conf, half)
@@ -716,7 +715,7 @@ async def annotation_masks(
         raise HTTPException(status_code=400, detail="Confidence must be between 0.01 and 0.95.")
 
     content = await image.read()
-    temp_path, pil_image = _image_to_temp_file(image, content)
+    temp_path, pil_image = await run_in_threadpool(_image_to_temp_file, image, content)
 
     try:
         result = await run_in_threadpool(_run_annotation_masks, temp_path, pil_image, conf)
@@ -778,7 +777,7 @@ async def segment_points(
 
     point_coords, point_labels = _parse_point_prompt_payload(points, labels)
     content = await image.read()
-    temp_path, pil_image, scale = _image_to_temp_file_with_scale(image, content)
+    temp_path, pil_image, scale = await run_in_threadpool(_image_to_temp_file_with_scale, image, content)
 
     try:
         result = await run_in_threadpool(
@@ -823,9 +822,10 @@ def _run_segmentation(
         if prompt:
             prompt_labels = _parse_prompt_labels(prompt)
             predictor = _get_predictor(conf=conf, half=half)
-            if hasattr(predictor, "args"):
-                predictor.args.conf = conf
             with _inference_lock:
+                # The predictor is shared; set per-request confidence only while holding the lock.
+                if hasattr(predictor, "args"):
+                    predictor.args.conf = conf
                 predictor.set_image(str(temp_path))
                 results = predictor(text=prompt_labels)
             mode = "text"
@@ -857,7 +857,7 @@ def _run_segmentation(
 def _run_annotation_masks(temp_path: Path, pil_image: Image.Image, conf: float) -> dict[str, Any]:
     try:
         results = _run_auto_predict(temp_path, conf)
-        instances = _extract_instances(results)
+        mask_arrays, scores = _extract_mask_arrays(results)
     except HTTPException:
         raise
     except Exception as exc:
@@ -865,11 +865,11 @@ def _run_annotation_masks(temp_path: Path, pil_image: Image.Image, conf: float) 
 
     width, height = pil_image.size
     masks: list[dict[str, Any]] = []
-    for index, instance in enumerate(instances):
-        geometry = _mask_to_geometry(instance["mask"], width, height)
+    for index, mask in enumerate(mask_arrays):
+        geometry = _mask_to_geometry(mask, width, height)
         if geometry is None:
             continue
-        masks.append({"id": f"mask-{index}", **geometry})
+        masks.append({"id": f"mask-{index}", "score": float(scores[index]), **geometry})
 
     return {
         "width": width,

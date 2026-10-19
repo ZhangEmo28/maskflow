@@ -51,7 +51,7 @@
           </span>
         </div>
         <button class="btn" :disabled="loading || !annotate.ready || !canRunAnnotateAi" @click="runCurrentMask">运行当前图片</button>
-        <button class="btn secondary" :disabled="loading || !files.rows.length || !canRunAnnotateAi" @click="runMasks">批量运行 AI</button>
+        <button class="btn secondary" :disabled="loading || !files.rows.length || !canRunAnnotateAi" title="默认只处理未标注的图片" @click="runMasks">批量运行 AI</button>
         <button class="btn secondary" :disabled="loading || !annotate.ready || (!annotate.dirty && !annotationStats.pending)" @click="saveAnnotation">保存</button>
         <button class="btn ghost" :disabled="!projects.selectedId || !annotate.labels.length" @click="createExport">导出 ZIP</button>
       </section>

@@ -1,4 +1,6 @@
-﻿using Microsoft.AspNetCore.Http.Features;
+﻿using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.OpenApi;
 using MaskFlow.Api.Application;
 using MaskFlow.Api.Infrastructure;
@@ -21,6 +23,19 @@ builder.Services.AddCors(options =>
         .WithOrigins(corsOrigins)
         .AllowAnyHeader()
         .AllowAnyMethod());
+});
+
+// Behind the bundled nginx every request comes from the proxy; restore the real client IP
+// so login rate limiting and device records work per client.
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+    foreach (var network in TrustedProxies.Parse(Environment.GetEnvironmentVariable("MASKFLOW_TRUSTED_PROXIES")))
+    {
+        options.KnownNetworks.Add(network);
+    }
 });
 
 builder.Services.AddTransient<SamInternalKeyHandler>();
@@ -73,6 +88,13 @@ var app = builder.Build();
 
 ProductionSecretsValidator.EnsureConfigured(app.Environment);
 
+app.UseForwardedHeaders();
+app.UseExceptionHandler(new ExceptionHandlerOptions
+{
+    ExceptionHandler = ApiExceptionHandler.HandleAsync,
+    // Business "not found" errors are real responses, not a reason to rethrow.
+    AllowStatusCode404Response = true
+});
 app.UseCors();
 if (app.Environment.IsDevelopment())
 {
