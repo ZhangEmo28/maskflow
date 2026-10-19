@@ -16,11 +16,13 @@ public static class McpSetup
         1. list_projects / get_project to find the project (or create_project). Labels may be Chinese; for SAM 3
            text detection give each label an English prompt with update_labels (e.g. 安全帽 -> "hard hat").
         2. auto_annotate_image on one or two images, then view_image to check the result visually before running
-           auto_annotate_project on the rest (a background task: poll get_task).
+           auto_annotate_project on the rest (a background task: poll get_task). Images where AI detects nothing stay
+           "unannotated" (not saved); retry with a lower conf or another mode, or add targets with edit_annotations.
         3. check_quality, then view_image the flagged images and fix them with edit_annotations (coordinates are
            normalized 0-1, box = [x1, y1, x2, y2]). Targets you add or change stay unconfirmed; only call
            confirm_annotations after the user agrees, because "confirmed" means a human approved it.
-        4. list_base_weights, then start_training (needs images in both train and val). Poll get_training; when done,
+        4. check_training_data first: it blocks too-small datasets and tells the user how many more images of which
+           class (and what kind) to add. Then list_base_weights and start_training. Poll get_training; when done,
            report validation/test mAP and per-class results, and view_training_plot for the confusion matrix.
         5. evaluate_model compares a model's predictions with human-confirmed labels and lists the worst images.
         AI runs (auto annotation, model predictions in view_image/evaluate_model) consume the project owner's daily AI quota.

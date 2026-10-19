@@ -140,10 +140,10 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
 
             await ApplyAsync(connection, tx, "annotation_sets", "id",
                 ["id", "user_id", "file_id", "width", "height", "annotations_json", "yolo_txt", "created_at", "updated_at",
-                 "review_status", "review_comment", "reviewed_by", "reviewed_at", "submitted_by"],
+                 "review_status", "review_comment", "reviewed_by", "reviewed_at", "submitted_by", "background"],
                 before.AnnotationSets, current.AnnotationSets, x => x.Id,
                 x => [x.Id, x.UserId, x.FileId, x.Width, x.Height, Json(x.Annotations), x.YoloTxt, x.CreatedAt, x.UpdatedAt,
-                      x.ReviewStatus, x.ReviewComment, x.ReviewedBy, x.ReviewedAt, x.SubmittedBy]);
+                      x.ReviewStatus, x.ReviewComment, x.ReviewedBy, x.ReviewedAt, x.SubmittedBy, x.Background]);
 
             await ApplyAsync(connection, tx, "project_members", "id",
                 ["id", "project_id", "user_id", "role", "invited_by", "created_at"],
@@ -333,7 +333,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
 
     async Task LoadAnnotationSetsAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM annotation_sets", r =>
         s.AnnotationSets.Add(new AnnotationSet(S(r, "id"), I(r, "user_id"), I(r, "file_id"), I(r, "width"), I(r, "height"), FromJson<List<AnnotationItem>>(S(r, "annotations_json")) ?? [], S(r, "yolo_txt"), D(r, "created_at"), D(r, "updated_at"),
-            N(r, "review_status") ?? "draft", N(r, "review_comment"), NI(r, "reviewed_by"), ND(r, "reviewed_at"), NI(r, "submitted_by"))));
+            N(r, "review_status") ?? "draft", N(r, "review_comment"), NI(r, "reviewed_by"), ND(r, "reviewed_at"), NI(r, "submitted_by"), B(r, "background"))));
 
     async Task LoadProjectMembersAsync(MySqlConnection c, MaskFlowState s) => await ReadAsync(c, "SELECT * FROM project_members", r =>
         s.ProjectMembers.Add(new ProjectMember(S(r, "id"), S(r, "project_id"), I(r, "user_id"), S(r, "role"), I(r, "invited_by"), D(r, "created_at"))));
@@ -926,6 +926,7 @@ public sealed class MySqlMaskFlowRepository : IMaskFlowRepository
         "ALTER TABLE annotation_sets ADD COLUMN review_comment VARCHAR(1000) NULL",
         "ALTER TABLE annotation_sets ADD COLUMN reviewed_by INT NULL",
         "ALTER TABLE annotation_sets ADD COLUMN reviewed_at DATETIME(6) NULL",
-        "ALTER TABLE annotation_sets ADD COLUMN submitted_by INT NULL"
+        "ALTER TABLE annotation_sets ADD COLUMN submitted_by INT NULL",
+        "ALTER TABLE annotation_sets ADD COLUMN background TINYINT(1) NOT NULL DEFAULT 0"
     ];
 }

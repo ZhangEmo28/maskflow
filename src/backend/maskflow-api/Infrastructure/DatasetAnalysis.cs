@@ -38,11 +38,17 @@ public sealed record DatasetExportPlan(
         {
             Annotations = MaskFlowStore.NormalizeAnnotations(x.Value.Annotations, labels)
         });
+        // Only real annotations take part: images with targets, or marked as background by a person.
+        // An empty result (e.g. AI found nothing) must not become a "nothing here" training example.
+        sets = sets.Where(x => MaskFlowStore.IsAnnotated(x.Value)).ToDictionary(x => x.Key, x => x.Value);
         var excludedUnconfirmed = 0;
         if (request.ConfirmedOnly)
         {
             excludedUnconfirmed = sets.Values.Sum(x => x.Annotations.Count(a => MaskFlowStore.IsExportableAnnotation(a) && !a.Confirmed));
-            sets = sets.ToDictionary(x => x.Key, x => x.Value with { Annotations = x.Value.Annotations.Where(a => a.Confirmed).ToList() });
+            // Images whose targets are all unconfirmed are left out rather than exported as background.
+            sets = sets.Select(x => (x.Key, Set: x.Value with { Annotations = x.Value.Annotations.Where(a => a.Confirmed).ToList() }))
+                .Where(x => x.Set.Annotations.Count > 0 || x.Set.Background)
+                .ToDictionary(x => x.Key, x => x.Set);
         }
         var exported = files.Where(x => sets.ContainsKey(x.Id)
             && (format != "classification-crops" || sets[x.Id].Annotations.Any(MaskFlowStore.IsExportableAnnotation))).ToList();

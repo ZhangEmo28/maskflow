@@ -68,7 +68,8 @@ public sealed class FilesController : MaskFlowControllerBase
                     file.ContentType,
                     file.CreatedAt,
                     file.DownloadUrl,
-                    Annotated = set is not null,
+                    Annotated = MaskFlowStore.IsAnnotated(set),
+                    Status = MaskFlowStore.AnnotationStatus(set),
                     AnnotationCount = set?.Annotations.Count ?? 0,
                     // Review queue ordering: images whose least certain unreviewed target is lowest come first.
                     UnconfirmedCount = unconfirmed.Count,
@@ -93,6 +94,17 @@ public sealed class FilesController : MaskFlowControllerBase
         var provider = new FileExtensionContentTypeProvider();
         provider.TryGetContentType(file.Name, out var contentType);
         return File(await Store.OpenStoredObjectAsync(file.Path), contentType ?? "application/octet-stream", file.Name);
+    }
+
+    // Deletes the selected images of one project (with their annotations) in a single write.
+    [HttpPost("bulk-delete")]
+    public async Task<IActionResult> BulkDelete([FromBody] FileBulkRequest request)
+    {
+        var user = CurrentUser();
+        var access = Store.RequireProjectAccess(user.Id, request.ProjectId, Permissions.Review);
+        if (request.FileIds is not { Count: > 0 }) return BadRequest(new { detail = "请先选择图片。" });
+        var deleted = await Store.DeleteFilesAsync(access.OwnerId, request.ProjectId, request.FileIds);
+        return Ok(new { deleted, user = Store.PublicUser(Store.GetUser(user.Id)!) });
     }
 
     [HttpDelete("{fileId:int}")]

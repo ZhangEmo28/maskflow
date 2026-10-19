@@ -99,7 +99,7 @@ public class McpEndpointTests(McpApp app) : IClassFixture<McpApp>
                  {
                      "list_projects", "get_project", "create_project", "update_labels", "check_quality", "export_dataset", "list_models",
                      "list_base_weights", "list_images", "get_annotations", "view_image", "auto_annotate_image", "auto_annotate_project",
-                     "get_task", "edit_annotations", "confirm_annotations", "review_image", "evaluate_model", "start_training",
+                     "get_task", "edit_annotations", "confirm_annotations", "clear_annotations", "review_image", "evaluate_model", "check_training_data", "start_training",
                      "list_trainings", "get_training", "cancel_training", "view_training_plot"
                  })
         {
@@ -177,16 +177,22 @@ public class McpEndpointTests(McpApp app) : IClassFixture<McpApp>
     [Fact]
     public async Task Agent_TrainsReadsResultsAndEvaluatesTheModel()
     {
-        var (user, mcp, projectId, files) = await ProjectWithImagesAsync(8);
-        foreach (var file in files)
+        var (user, mcp, projectId, files) = await ProjectWithImagesAsync(20);
+        var tooEarly = await Call(mcp, "check_training_data", new { project_id = projectId });
+        Assert.False(tooEarly.GetProperty("ok").GetBoolean());
+        Assert.Contains("至少需要 20 张", tooEarly.GetProperty("blockers")[0].GetString());
+
+        // Every image has a car; every second one also a person (20 car / 10 person images).
+        for (var i = 0; i < files.Count; i++)
         {
-            var response = await user.Put($"/api/annotations/file/{file}", new
-            {
-                fileId = file, width = 64, height = 48,
-                annotations = new[] { new { id = "gt", classId = 0, label = "car", bbox = new { cx = 0.3, cy = 0.3, width = 0.2, height = 0.2 }, confidence = 1.0, confirmed = true } }
-            });
-            response.EnsureSuccessStatusCode();
+            var targets = new List<object> { new { id = "car", classId = 0, label = "car", bbox = new { cx = 0.3, cy = 0.3, width = 0.2, height = 0.2 }, confidence = 1.0, confirmed = true } };
+            if (i % 2 == 1) targets.Add(new { id = "person", classId = 1, label = "person", bbox = new { cx = 0.8, cy = 0.8, width = 0.1, height = 0.1 }, confidence = 1.0, confirmed = true });
+            (await user.Put($"/api/annotations/file/{files[i]}", new { fileId = files[i], width = 64, height = 48, annotations = targets })).EnsureSuccessStatusCode();
         }
+
+        var ready = await Call(mcp, "check_training_data", new { project_id = projectId, base_weight = "yolo11n.pt", train = 75, val = 25, test = 0 });
+        Assert.True(ready.GetProperty("ok").GetBoolean(), ready.GetRawText());
+        Assert.Contains(ready.GetProperty("suggestions").EnumerateArray(), x => x.GetString()!.Contains("背景图"));
 
         var weights = await Call(mcp, "list_base_weights");
         Assert.True(weights.GetProperty("available").GetBoolean());
@@ -209,10 +215,11 @@ public class McpEndpointTests(McpApp app) : IClassFixture<McpApp>
         var plot = await mcp.CallToolAsync("view_training_plot", Args(new { training_id = trainingId, plot = "confusion_matrix" }));
         Assert.Equal("image/png", Assert.Single(plot.Content.OfType<ImageContentBlock>()).MimeType);
 
+        // Predictions: a car where every image has one, and a person at the spot only odd images have one.
         var evaluation = await Call(mcp, "evaluate_model", new { model_id = modelId, project_id = projectId, max_images = 4 });
         var overall = evaluation.GetProperty("overall");
-        Assert.Equal((4, 4, 0), (overall.GetProperty("tp").GetInt32(), overall.GetProperty("fp").GetInt32(), overall.GetProperty("fn").GetInt32()));
-        Assert.Equal(4, evaluation.GetProperty("worstImages").GetArrayLength());
+        Assert.Equal((6, 2, 0), (overall.GetProperty("tp").GetInt32(), overall.GetProperty("fp").GetInt32(), overall.GetProperty("fn").GetInt32()));
+        Assert.Equal(2, evaluation.GetProperty("worstImages").GetArrayLength());
         var models = await Call(mcp, "list_models", new { project_id = projectId });
         Assert.Equal(trainingId, models.GetProperty("models")[0].GetProperty("trainingId").GetString());
     }
@@ -267,7 +274,7 @@ public class AgentToolTests
             Item("car", 0.9, 0.9, 0.01, 0.01, id: "tiny"),
             Item("car", 0.5, 0.5, 1, 0.98, 0.3, confirmed: false, id: "huge")
         ]));
-        await store.SaveAnnotationSetAsync(owner.Id, new AnnotationSaveRequest(files[1].Id, 100, 100, []));
+        await store.SaveAnnotationSetAsync(owner.Id, new AnnotationSaveRequest(files[1].Id, 100, 100, [], Background: true));
 
         var report = JsonSerializer.SerializeToElement(QualityCheck.Run(store.State, project, ["car", "person", "bike"]));
         var kinds = report.GetProperty("issues").EnumerateArray()
@@ -281,7 +288,7 @@ public class AgentToolTests
         Assert.Equal(["huge"], kinds["huge_box"]);
         Assert.Equal(["huge"], kinds["low_confidence"]);
         Assert.Contains("label_missing", kinds.Keys);  // bike
-        Assert.Equal((1, 1), (report.GetProperty("unannotatedImages").GetInt32(), report.GetProperty("imagesWithoutTargets").GetInt32()));
+        Assert.Equal((1, 1), (report.GetProperty("unannotatedImages").GetInt32(), report.GetProperty("backgroundImages").GetInt32()));
     }
 
     [Fact]

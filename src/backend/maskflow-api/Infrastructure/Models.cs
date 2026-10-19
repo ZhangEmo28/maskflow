@@ -52,13 +52,19 @@ public record ProjectLabelsRequest(List<string> Labels);
 public record TaskCreate(string Type, string? Title, string? ProjectId, int? FileId, int ImageCount = 1);
 public record ExportRequest(string? ProjectId, string? TaskId, SplitConfig? Split, string Format = "yolo", int Seed = 42, bool ConfirmedOnly = false, bool GroupNearDuplicates = true);
 public record AnnotationAutoRequest(int FileId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null);
-public record AnnotationBatchRequest(string ProjectId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null, string Scope = "unannotated");
+// FileIds (optional) restricts the run to selected images; otherwise Scope picks "unannotated" or "all".
+public record AnnotationBatchRequest(string ProjectId, double Conf = 0.25, string? DefaultLabel = null, string? Mode = null, string? ModelId = null, string Scope = "unannotated",
+    List<int>? FileIds = null);
+public record FileBulkRequest(string ProjectId, List<int> FileIds);
+// Mode "all" removes every target (the image becomes unannotated); "unconfirmed" keeps human-confirmed targets.
+public record AnnotationClearRequest(string ProjectId, List<int> FileIds, string Mode = "all");
 public record LabelPromptsRequest(Dictionary<string, string?> Prompts);
 public record ImportOptions(string? Format, bool Confirmed = true, string OnExisting = "skip", bool ImportImages = true);
 public record ImportSummary(string Format, int ImagesAdded, int ImagesAnnotated, int AnnotationsImported, int SkippedExisting, List<string> NewLabels, List<string> UnmatchedAnnotations, List<string> Warnings);
 public record AiModel(string Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Sha256, List<string>? ClassNames, DateTimeOffset CreatedAt);
 public record AnnotationPointsRequest(int FileId, List<double[]> Points, List<int> Labels, double Conf = 0.25);
-public record AnnotationSaveRequest(int FileId, int Width, int Height, List<AnnotationItem> Annotations);
+// Background = a person checked the image and it has no targets (a negative sample for training).
+public record AnnotationSaveRequest(int FileId, int Width, int Height, List<AnnotationItem> Annotations, bool Background = false);
 public record JobCreate(string Type, int UserId, string? ProjectId, Dictionary<string, object?> Input, Dictionary<string, object?> Params);
 public record JobEventCreate(string EventType, Dictionary<string, object?> Payload, string? Status, double? Progress, string? Error);
 public record NodeRegister(int OwnerId = 0, string Pool = "platform-gpu", string? GpuModel = null, int? VramGb = null, string? Region = null, double? PricePerHour = null);
@@ -76,7 +82,8 @@ public record Project(string Id, int UserId, string Name, string Description, st
 public record FileItem(int Id, int UserId, string? ProjectId, string Name, string Path, long Size, string Kind, string? ContentType, DateTimeOffset CreatedAt, string DownloadUrl, string? Phash = null);
 // Review: draft -> submitted (annotator) -> approved / rejected (reviewer). Solo projects stay "draft".
 public record AnnotationSet(string Id, int UserId, int FileId, int Width, int Height, List<AnnotationItem> Annotations, string YoloTxt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
-    string ReviewStatus = "draft", string? ReviewComment = null, int? ReviewedBy = null, DateTimeOffset? ReviewedAt = null, int? SubmittedBy = null);
+    string ReviewStatus = "draft", string? ReviewComment = null, int? ReviewedBy = null, DateTimeOffset? ReviewedAt = null, int? SubmittedBy = null,
+    bool Background = false);
 
 // Project sharing: data and quota stay with the owner (Project.UserId); members act through their role.
 public record ProjectMember(string Id, string ProjectId, int UserId, string Role, int InvitedBy, DateTimeOffset CreatedAt)

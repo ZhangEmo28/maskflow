@@ -67,8 +67,14 @@ public sealed class AnnotationController : ControllerBase
 
         try
         {
-            var set = await annotator.RunAsync(ownerId, file, options, recordTask: true, HttpContext.RequestAborted);
-            return Ok(new { annotation = set, user = store.PublicUser(store.GetUser(user.Id)!) });
+            var result = await annotator.RunAsync(ownerId, file, options, recordTask: true, HttpContext.RequestAborted);
+            return Ok(new
+            {
+                annotation = result.Annotation,
+                detected = result.Detected,
+                detail = result.Detected == 0 ? "没有检测到目标，图片保持原状态。可降低置信度阈值、换一种 AI 方式，或手动标注。" : null,
+                user = store.PublicUser(store.GetUser(user.Id)!)
+            });
         }
         catch (SamServiceException ex)
         {
@@ -187,6 +193,18 @@ public sealed class AnnotationController : ControllerBase
         if (set is null) return NotFound(new { detail = "Annotation not found." });
         var next = await store.SaveAnnotationSetAsync(ownerId, new AnnotationSaveRequest(fileId, set.Width, set.Height, set.Annotations.Where(x => x.Id != annotationId).ToList()), access?.Role ?? "owner");
         return Ok(new { annotation = next });
+    }
+
+    // Clears the annotations of selected images; annotators may only drop unconfirmed AI results.
+    [HttpPost("/api/annotations/clear")]
+    public async Task<IActionResult> Clear([FromBody] AnnotationClearRequest request)
+    {
+        var user = store.RequireUser(HttpContext);
+        var unconfirmedOnly = request.Mode == "unconfirmed";
+        var access = store.RequireProjectAccess(user.Id, request.ProjectId, unconfirmedOnly ? Permissions.Edit : Permissions.Review);
+        if (request.FileIds is not { Count: > 0 }) return BadRequest(new { detail = "请先选择图片。" });
+        var (images, targets) = await store.ClearAnnotationsAsync(access.OwnerId, request.ProjectId, request.FileIds, unconfirmedOnly);
+        return Ok(new { images, targets });
     }
 
     // Review workflow: annotators submit, reviewers approve (confirms labelled targets) or reject with a reason.

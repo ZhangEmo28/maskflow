@@ -213,7 +213,7 @@ public sealed partial class MaskFlowStore
         {
             var projectFiles = State.Files.Where(x => x.ProjectId == access.Project.Id).OrderBy(x => x.Id).ToList();
             var assigned = State.FileAssignments.Select(x => x.FileId).ToHashSet();
-            var annotated = State.AnnotationSets.Where(x => x.UserId == access.OwnerId).Select(x => x.FileId).ToHashSet();
+            var annotated = State.AnnotationSets.Where(x => x.UserId == access.OwnerId && IsAnnotated(x)).Select(x => x.FileId).ToHashSet();
             var targets = request.FileIds is { Count: > 0 }
                 ? projectFiles.Where(x => request.FileIds.Contains(x.Id)).ToList()
                 : request.Scope switch

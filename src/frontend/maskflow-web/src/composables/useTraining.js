@@ -13,6 +13,8 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     images: {},
     status: "",
     busy: false,
+    readiness: null,
+    checking: false,
     form: {
       baseWeight: "",
       epochs: 50,
@@ -25,6 +27,50 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     }
   });
   let timer = null;
+  let checkTimer = null;
+  let checkSeq = 0;
+
+  function requestBody() {
+    const form = training.form;
+    return {
+      baseWeight: form.baseWeight,
+      epochs: Number(form.epochs),
+      imageSize: Number(form.imageSize),
+      batch: Number(form.batch),
+      patience: Number(form.patience),
+      split: { train: Number(form.split.train), val: Number(form.split.val), test: Number(form.split.test) },
+      confirmedOnly: form.confirmedOnly,
+      name: form.name.trim() || null
+    };
+  }
+
+  // Re-checks the data whenever project, weight, split or "confirmed only" change (debounced).
+  function scheduleReadinessCheck() {
+    clearTimeout(checkTimer);
+    checkTimer = setTimeout(checkReadiness, 350);
+  }
+
+  async function checkReadiness() {
+    const projectId = projects.selectedId;
+    const seq = ++checkSeq;
+    if (!projectId) {
+      training.readiness = null;
+      return;
+    }
+    if (trainingSplitTotal.value !== 100) {
+      training.readiness = { error: "训练、验证、测试比例之和需要等于 100%。" };
+      return;
+    }
+    training.checking = true;
+    try {
+      const data = await apiFetch(`/api/projects/${projectId}/trainings/check`, { method: "POST", body: requestBody() });
+      if (seq === checkSeq) training.readiness = data.readiness;
+    } catch (error) {
+      if (seq === checkSeq) training.readiness = { error: error.message };
+    } finally {
+      if (seq === checkSeq) training.checking = false;
+    }
+  }
 
   const canTrain = computed(() => ["owner", "reviewer"].includes(currentRole.value));
   const canDeleteTraining = computed(() => currentRole.value === "owner");
@@ -110,10 +156,12 @@ export function useTraining({ projects, selectedProject, currentRole }) {
       training.status = error.message;
     }
     schedulePoll();
+    scheduleReadinessCheck();
   }
 
   function stopTrainingPoll() {
     clearTimeout(timer);
+    clearTimeout(checkTimer);
   }
 
   async function openTraining(id) {
@@ -131,20 +179,7 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     training.busy = true;
     training.status = "";
     try {
-      const form = training.form;
-      const data = await apiFetch(`/api/projects/${projects.selectedId}/trainings`, {
-        method: "POST",
-        body: {
-          baseWeight: form.baseWeight,
-          epochs: Number(form.epochs),
-          imageSize: Number(form.imageSize),
-          batch: Number(form.batch),
-          patience: Number(form.patience),
-          split: { ...form.split },
-          confirmedOnly: form.confirmedOnly,
-          name: form.name.trim() || null
-        }
-      });
+      const data = await apiFetch(`/api/projects/${projects.selectedId}/trainings`, { method: "POST", body: requestBody() });
       training.selectedId = data.training.id;
       training.status = "训练已加入队列，可以离开页面，完成后会发邮件通知。";
       await loadRuns();
@@ -193,6 +228,7 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     trainingSplitTotal,
     refreshTraining,
     stopTrainingPoll,
+    scheduleReadinessCheck,
     openTraining,
     startTraining,
     cancelTraining,

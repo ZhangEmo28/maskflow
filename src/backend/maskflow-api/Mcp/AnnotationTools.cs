@@ -19,10 +19,10 @@ public sealed record TargetChange(
 [McpServerToolType]
 public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoAnnotationService annotator, BatchAnnotationWorker batches, SamInferenceGate samGate)
 {
-    static readonly string[] ImageFilters = ["all", "unannotated", "unconfirmed", "confirmed", "empty", "submitted", "rejected", "approved"];
+    static readonly string[] ImageFilters = ["all", "unannotated", "pending", "confirmed", "background", "submitted", "rejected", "approved"];
 
     [McpServerTool(Name = "list_images", Title = "列出图片", ReadOnly = true, Idempotent = true)]
-    [Description("List images of a project with their annotation state. status: all | unannotated | unconfirmed (has AI targets awaiting review) | confirmed (all targets confirmed) | empty (annotated, no targets) | submitted | rejected | approved. Unconfirmed images are sorted lowest-confidence first.")]
+    [Description("List images of a project with their annotation state. status: all | unannotated (no targets yet, including images where AI found nothing) | pending (has targets awaiting human confirmation) | confirmed (all targets confirmed) | background (a person marked it as containing no targets) | submitted | rejected | approved. Pending images are sorted lowest-confidence first.")]
     public object ListImages(string project_id, string status = "all", int limit = 50, int offset = 0) => McpCaller.Run(() =>
     {
         if (!ImageFilters.Contains(status)) throw new McpException($"status 只能是：{string.Join(", ", ImageFilters)}");
@@ -38,7 +38,7 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
                 {
                     fileId = file.Id,
                     file.Name,
-                    annotated = set is not null,
+                    status = MaskFlowStore.AnnotationStatus(set),
                     targets = set?.Annotations.Count ?? 0,
                     unconfirmed = unconfirmed.Count,
                     minConfidence = unconfirmed.Count == 0 ? (double?)null : Math.Round(unconfirmed.Min(x => x.Confidence), 3),
@@ -48,15 +48,12 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
             })
             .Where(x => status switch
             {
-                "unannotated" => !x.annotated,
-                "unconfirmed" => x.unconfirmed > 0,
-                "confirmed" => x.targets > 0 && x.unconfirmed == 0,
-                "empty" => x.annotated && x.targets == 0,
+                "unannotated" or "pending" or "confirmed" or "background" => x.status == status,
                 "submitted" or "rejected" or "approved" => x.reviewStatus == status,
                 _ => true
             })
             .ToList();
-        if (status == "unconfirmed") rows = rows.OrderBy(x => x.minConfidence).ToList();
+        if (status == "pending") rows = rows.OrderBy(x => x.minConfidence).ToList();
         return new { total = rows.Count, offset, images = rows.Skip(Math.Max(0, offset)).Take(Math.Clamp(limit, 1, 200)) };
     });
 
@@ -129,11 +126,19 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
         store.EnsureAiQuotaAvailable(store.GetUser(ownerId)!);
         var options = AutoAnnotationOptions.Create(mode, conf, default_label, model_id);
         await using var slot = await samGate.WaitAsync(caller.Aborted);
-        var set = await annotator.RunAsync(ownerId, file, options, recordTask: true, caller.Aborted);
+        var result = await annotator.RunAsync(ownerId, file, options, recordTask: true, caller.Aborted);
+        if (result.Detected == 0)
+        {
+            return new { fileId = file_id, mode = options.Mode, detected = 0, status = MaskFlowStore.AnnotationStatus(result.Annotation),
+                next = "没有检测到目标，图片未被标记为已标注。可降低 conf、换 mode，或用 edit_annotations 手动添加。" };
+        }
+
+        var set = result.Annotation!;
         return new
         {
             fileId = file_id,
             mode = options.Mode,
+            detected = result.Detected,
             targets = set.Annotations.Count,
             byLabel = set.Annotations.GroupBy(x => x.Label ?? "(未分配)").ToDictionary(x => x.Key, x => x.Count()),
             next = "用 view_image 查看效果"
@@ -141,12 +146,13 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
     });
 
     [McpServerTool(Name = "auto_annotate_project", Title = "批量 AI 标注", Idempotent = false)]
-    [Description("Queue AI annotation for many images of a project as a background task (same modes as auto_annotate_image). scope: unannotated (default) or all (re-run; confirmed targets are kept). Returns a task id; poll get_task. Uses 1 AI quota per image.")]
+    [Description("Queue AI annotation for many images of a project as a background task (same modes as auto_annotate_image). Either file_ids (specific images, e.g. from list_images) or scope: unannotated (default) or all (re-run; confirmed targets are kept). Returns a task id; poll get_task — it reports how many images got targets and how many had nothing detected (those stay unannotated). Uses 1 AI quota per image with results.")]
     public Task<object> AutoAnnotateProject(string project_id, string mode = "concepts", string scope = "unannotated", string? model_id = null,
-        double conf = 0.25, string? default_label = null) => McpCaller.RunAsync<object>(async () =>
+        double conf = 0.25, string? default_label = null, [Description("Only these images")] int[]? file_ids = null) => McpCaller.RunAsync<object>(async () =>
     {
         var access = caller.Project(project_id, Permissions.Edit);
-        var task = await batches.QueueAsync(access, new AnnotationBatchRequest(project_id, conf, default_label, mode, model_id, scope == "all" ? "all" : "unannotated"));
+        var task = await batches.QueueAsync(access, new AnnotationBatchRequest(project_id, conf, default_label, mode, model_id, scope == "all" ? "all" : "unannotated",
+            file_ids?.ToList()));
         return new { taskId = task.Id, task.Title, task.Status, images = task.ImageCount, next = "用 get_task 查看进度" };
     });
 
@@ -159,7 +165,8 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
         return new
         {
             task.Id, task.Type, task.Title, task.Status, progress = Math.Round(task.Progress, 3), total = task.ImageCount,
-            processed = progress.Processed, succeeded = progress.Succeeded, failed = progress.Failed, lastError = progress.LastError ?? task.ErrorMessage,
+            processed = progress.Processed, succeeded = progress.Succeeded, noTargets = progress.NoTargets, failed = progress.Failed,
+            lastError = progress.LastError ?? task.ErrorMessage,
             task.CreatedAt, task.FinishedAt
         };
     });
@@ -232,6 +239,16 @@ public sealed class AnnotationTools(McpCaller caller, MaskFlowStore store, AutoA
         var access = caller.Project(project_id, Permissions.Review);
         var (targets, images) = await store.ConfirmAnnotationsAsync(access.OwnerId, project_id, file_ids, labels, min_confidence);
         return new { confirmedTargets = targets, images };
+    });
+
+    [McpServerTool(Name = "clear_annotations", Title = "清除标注", Destructive = true, Idempotent = true)]
+    [Description("Remove annotations from the given images so they count as unannotated again. mode: unconfirmed (default; drops AI results awaiting review, keeps human-confirmed targets) or all (owner/reviewer; removes everything). Ask the user before using mode=all.")]
+    public Task<object> ClearAnnotations(string project_id, int[] file_ids, string mode = "unconfirmed") => McpCaller.RunAsync<object>(async () =>
+    {
+        var unconfirmedOnly = mode != "all";
+        var access = caller.Project(project_id, unconfirmedOnly ? Permissions.Edit : Permissions.Review);
+        var (images, targets) = await store.ClearAnnotationsAsync(access.OwnerId, project_id, file_ids, unconfirmedOnly);
+        return new { images, removedTargets = targets };
     });
 
     [McpServerTool(Name = "review_image", Title = "提交 / 审核", Idempotent = false)]

@@ -37,6 +37,20 @@ public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, Trainin
         return new { trainingId = run.Id, run.Name, run.Status, run.Format, images = run.ImageCount, next = "用 get_training 查看进度", webUrl = $"{McpCaller.PublicUrl}/train.html" };
     });
 
+    [McpServerTool(Name = "check_training_data", Title = "检查训练数据", ReadOnly = true, Idempotent = true)]
+    [Description("Check whether the project's annotations are ready for training, before starting: minimum image counts (blockers), how each class actually splits into train/val/test, class balance, background images, unconfirmed share, and concrete suggestions of how many more images of which kind to add. start_training refuses data with blockers.")]
+    public Task<object> CheckTrainingData(
+        string project_id,
+        [Description("Base weight file name (decides detect/segment/classify); optional")] string? base_weight = null,
+        int train = 70, int val = 20, int test = 10, bool confirmed_only = false) => McpCaller.RunAsync<object>(async () =>
+    {
+        var access = caller.Project(project_id, Permissions.Read);
+        var task = base_weight is null
+            ? MaskFlowStore.NormalizeDataType(access.Project.DataType) == "segmentation" ? "segment" : "detect"
+            : TrainingReadiness.TaskFromWeightName(base_weight);
+        return await store.CheckTrainingDataAsync(access, new TrainingRequest(base_weight ?? "", Split: new SplitConfig(train, val, test), ConfirmedOnly: confirmed_only), task);
+    });
+
     [McpServerTool(Name = "list_trainings", Title = "训练记录", ReadOnly = true, Idempotent = true)]
     [Description("Training runs of a project, newest first, with status and headline validation metrics.")]
     public object ListTrainings(string project_id) => McpCaller.Run(() =>

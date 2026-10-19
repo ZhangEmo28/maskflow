@@ -118,7 +118,7 @@ public sealed class AccountMailer(IEmailSender sender, ILogger<AccountMailer> lo
         $"MaskFlow 批量标注{(status == "completed" ? "已完成" : "已中止")}：{projectName}",
         $"""
         项目「{projectName}」的批量标注{(status == "completed" ? "已完成" : "已中止")}。
-        处理 {progress.Processed} 张：成功 {progress.Succeeded}，失败 {progress.Failed}。
+        处理 {progress.Processed} 张：成功 {progress.Succeeded}，未检测到目标 {progress.NoTargets}，失败 {progress.Failed}。
         {(progress.LastError is null ? "" : $"最近错误：{progress.LastError}")}
 
         打开 {PublicUrl}/annotate.html 查看结果。

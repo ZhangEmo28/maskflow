@@ -147,6 +147,11 @@ export function useMaskFlowApp() {
     zoom: 1,
     filter: "all",
     queueSort: "default",
+    // Multi-select in the image queue / file list (ids of the current project).
+    selectedIds: [],
+    selectAnchor: null,
+    autoNext: localStorage.getItem("maskflow.autoNext") === "1",
+    background: false,
     aiMode: localStorage.getItem("maskflow.aiMode") || "",
     modelId: localStorage.getItem("maskflow.aiModelId") || "",
     labelPrompts: {},
@@ -402,7 +407,10 @@ export function useMaskFlowApp() {
     const previousProjectId = projects.selectedId;
     projects.rows = data.projects || [];
     dashboard.projects = projects.rows;
-    if (!projects.selectedId && projects.rows.length) projects.selectedId = projects.rows[0].id;
+    if (!projects.selectedId && projects.rows.length) {
+      const remembered = localStorage.getItem("maskflow.projectId");
+      projects.selectedId = projects.rows.find((project) => project.id === remembered)?.id || projects.rows[0].id;
+    }
     if (projects.selectedId && !projects.rows.some((project) => project.id === projects.selectedId)) {
       projects.selectedId = projects.rows[0]?.id || "";
     }
@@ -483,8 +491,13 @@ export function useMaskFlowApp() {
   async function selectProject(projectId) {
     if (projectId !== projects.selectedId && !canLeaveCurrentAnnotation()) return;
     annotationSelection++;
-    if (projectId !== projects.selectedId) team.open = false;
+    if (projectId !== projects.selectedId) {
+      team.open = false;
+      annotate.selectedIds = [];
+      annotate.selectAnchor = null;
+    }
     projects.selectedId = projectId;
+    if (projectId) localStorage.setItem("maskflow.projectId", projectId);
     syncExportSplitFromProject();
     clearAnnotation();
     annotate.current = null;
@@ -844,6 +857,7 @@ export function useMaskFlowApp() {
       processed: result.processed ?? 0,
       succeeded: result.succeeded ?? 0,
       failed: result.failed ?? 0,
+      noTargets: result.noTargets ?? 0,
       lastError: result.lastError || task.errorMessage || ""
     };
   }
@@ -877,10 +891,10 @@ export function useMaskFlowApp() {
     if (!batch) return;
     const what = batch.type === "video_propagation" ? "视频传播" : "批量标注";
     annotate.status = batch.status === "completed"
-      ? `${what}完成：成功 ${batch.succeeded} 张${batch.failed ? `，失败 ${batch.failed} 张` : ""}${batch.lastError ? `（${batch.lastError}）` : ""}`
+      ? `${what}完成：成功 ${batch.succeeded} 张${batch.noTargets ? `，${batch.noTargets} 张未检测到目标（保持未标注，可在「未标注」中查看）` : ""}${batch.failed ? `，失败 ${batch.failed} 张` : ""}${batch.lastError ? `（${batch.lastError}）` : ""}`
       : batch.status === "cancelled"
         ? `${what}已取消，已处理 ${batch.processed} 张`
-        : `${what}中止：${batch.lastError || "未知错误"}`;
+        : `${what}未完成：${batch.lastError || "未知错误"}`;
   }
 
   async function resumeBatchTracking() {
@@ -965,6 +979,7 @@ export function useMaskFlowApp() {
     const data = await apiFetch(`/api/files${query}`).catch(() => ({ files: [] }));
     if (projectId !== projects.selectedId) return;
     files.rows = data.files || [];
+    if (annotate.selectedIds.length) annotate.selectedIds = selectedFileIds();
     if (data.user) {
       account.value = data.user;
       saveSession({ ...session(), user: data.user });
@@ -1143,7 +1158,7 @@ export function useMaskFlowApp() {
       projects.status = uploadQueue.skipped || uploadQueue.failed
         ? buildUploadSummary(result.uploaded, total)
         : `已上传 ${result.uploaded.length} / ${total} 张图片`;
-      await refreshFiles();
+      await Promise.all([refreshFiles(), refreshProjectCounts()]);
     } catch (error) {
       projects.status = error.message;
     } finally {
@@ -1159,7 +1174,7 @@ export function useMaskFlowApp() {
       account.value = data.user;
       saveSession({ ...session(), user: data.user });
     }
-    await refreshFiles();
+    await Promise.all([refreshFiles(), refreshProjectCounts()]);
     if (wasCurrent) {
       const nextFile = files.rows[Math.min(deletedIndex, files.rows.length - 1)] || files.rows[deletedIndex - 1] || null;
       if (nextFile) {
@@ -1608,6 +1623,7 @@ export function useMaskFlowApp() {
     annotate.annotations = (annotation.annotations || []).map(normalizeAnnotationItem);
     annotate.activeId = annotate.annotations[0]?.id || "";
     annotate.review = { status: annotation.reviewStatus || "draft", comment: annotation.reviewComment || "" };
+    annotate.background = Boolean(annotation.background) && !annotate.annotations.length;
     normalizeAnnotationLabels();
     if (options.status) {
       annotationHistory.record(annotate.annotations);
@@ -1626,6 +1642,7 @@ export function useMaskFlowApp() {
 
   function clearAnnotation() {
     annotate.ready = false;
+    annotate.background = false;
     annotate.annotations = [];
     annotate.activeId = "";
     annotate.width = 0;
@@ -1797,6 +1814,30 @@ export function useMaskFlowApp() {
     await refreshFiles();
   }
 
+  // Only images from a drop (folders and other files are ignored).
+  function droppedImages(event) {
+    return Array.from(event?.dataTransfer?.files || []).filter((file) => file.type.startsWith("image/") || /\.(jpe?g|png|webp|bmp|gif)$/i.test(file.name));
+  }
+
+  async function dropFilesToProject(event) {
+    const images = droppedImages(event);
+    if (!images.length) {
+      projects.status = annotate.status = "拖入的文件里没有图片";
+      return;
+    }
+    if (page.value === "annotate") return changeAnnotateFiles(images);
+    files.selected = images;
+    return uploadFiles();
+  }
+
+  // Image counts in the project selector after uploads/deletes, without reloading labels.
+  async function refreshProjectCounts() {
+    const data = await apiFetch("/api/projects").catch(() => null);
+    if (!data?.projects) return;
+    const counts = new Map(data.projects.map((project) => [project.id, project]));
+    projects.rows = projects.rows.map((project) => ({ ...project, ...(counts.get(project.id) || {}) }));
+  }
+
   async function changeAnnotateFiles(fileList) {
     annotate.selected = fileList;
     await uploadAnnotateFiles();
@@ -1817,7 +1858,7 @@ export function useMaskFlowApp() {
         annotate.status = "已取消上传";
         return;
       }
-      await refreshFiles();
+      await Promise.all([refreshFiles(), refreshProjectCounts()]);
       const first = result.uploaded[0];
       if (first) await selectAnnotateFile(first);
       annotate.status = uploadQueue.skipped || uploadQueue.failed
@@ -1847,9 +1888,7 @@ export function useMaskFlowApp() {
 
   const filteredFiles = computed(() => {
     let rows = files.rows;
-    if (annotate.filter === "annotated") rows = rows.filter((file) => file.annotated);
-    if (annotate.filter === "unannotated") rows = rows.filter((file) => !file.annotated);
-    if (annotate.filter === "review") rows = rows.filter((file) => file.unconfirmedCount > 0);
+    if (annotate.filter !== "all") rows = rows.filter((file) => fileStatusGroup(file) === annotate.filter);
     if (annotate.reviewQueue === "mine") rows = rows.filter((file) => file.assignedTo === account.value?.id);
     else if (annotate.reviewQueue !== "all") rows = rows.filter((file) => (file.reviewStatus || "draft") === annotate.reviewQueue);
     if (annotate.queueSort === "name") {
@@ -1863,6 +1902,11 @@ export function useMaskFlowApp() {
     return rows;
   });
   const currentFileIndex = computed(() => filteredFiles.value.findIndex((file) => file.id === annotate.current?.id));
+  const queueCounts = computed(() => {
+    const counts = { all: files.rows.length, unannotated: 0, review: 0, done: 0 };
+    for (const file of files.rows) counts[fileStatusGroup(file)] += 1;
+    return counts;
+  });
   const activeAnnotation = computed(() => annotate.annotations.find((item) => item.id === annotate.activeId) || null);
   const canRunAnnotateAi = computed(() => annotate.labels.length > 0);
   const annotationStats = computed(() => {
@@ -2087,12 +2131,12 @@ export function useMaskFlowApp() {
       method: "POST",
       body: { fileId: file.id, ...aiRequestOptions() }
     });
-    if (updateCurrent && selection === annotationSelection && revision === annotationEditRevision) applyAnnotation(data.annotation);
+    if (data.detected > 0 && updateCurrent && selection === annotationSelection && revision === annotationEditRevision) applyAnnotation(data.annotation);
     if (data.user) {
       account.value = data.user;
       saveSession({ ...session(), user: data.user });
     }
-    return data.annotation;
+    return data;
   }
 
   async function runCurrentMask() {
@@ -2111,7 +2155,11 @@ export function useMaskFlowApp() {
     const revision = annotationEditRevision;
     annotate.status = `正在分割标注：${annotate.current.name}`;
     try {
-      await runMaskForFile(file, { updateCurrent: true });
+      const result = await runMaskForFile(file, { updateCurrent: true });
+      if (!result.detected) {
+        annotate.status = `没有检测到目标，图片保持「${fileStatusLabels[fileStatusGroup(file)]}」。可调低置信度阈值、换一种 AI 方式，或手动画框（B）。`;
+        return;
+      }
       await refreshFiles();
       // A model's class names are learned on first use; refresh so the panel shows them.
       if (effectiveAiMode.value === "model") await loadProjectModels();
@@ -2124,6 +2172,115 @@ export function useMaskFlowApp() {
     } finally {
       loading.value = false;
     }
+  }
+
+  // ---- Image status and multi-select ----
+
+  const fileStatusLabels = { unannotated: "未标注", review: "待确认", done: "已确认" };
+  const fileStatusText = { unannotated: "未标注", pending: "待确认", confirmed: "已确认", background: "背景图" };
+
+  // Queue groups: still to label, AI results awaiting review, done (confirmed or background).
+  function fileStatusGroup(file) {
+    const status = file?.status || (file?.annotated ? (file.unconfirmedCount ? "pending" : "confirmed") : "unannotated");
+    return status === "unannotated" ? "unannotated" : status === "pending" ? "review" : "done";
+  }
+
+  function isFileSelected(file) {
+    return annotate.selectedIds.includes(file.id);
+  }
+
+  // Shift-click selects the range from the last clicked image within the visible list.
+  function toggleFileSelection(file, event, list) {
+    const rows = list || filteredFiles.value;
+    const selected = new Set(annotate.selectedIds);
+    const turnOn = !selected.has(file.id);
+    const anchorIndex = rows.findIndex((item) => item.id === annotate.selectAnchor);
+    const index = rows.findIndex((item) => item.id === file.id);
+    if (event?.shiftKey && anchorIndex >= 0 && index >= 0) {
+      const [from, to] = anchorIndex < index ? [anchorIndex, index] : [index, anchorIndex];
+      for (const item of rows.slice(from, to + 1)) turnOn ? selected.add(item.id) : selected.delete(item.id);
+    } else if (turnOn) {
+      selected.add(file.id);
+    } else {
+      selected.delete(file.id);
+    }
+    annotate.selectAnchor = file.id;
+    annotate.selectedIds = [...selected];
+  }
+
+  function setAllSelected(list, checked) {
+    const ids = new Set(annotate.selectedIds);
+    for (const file of list) checked ? ids.add(file.id) : ids.delete(file.id);
+    annotate.selectedIds = [...ids];
+  }
+
+  function clearFileSelection() {
+    annotate.selectedIds = [];
+    annotate.selectAnchor = null;
+  }
+
+  function selectedFileIds() {
+    const present = new Set(files.rows.map((file) => file.id));
+    return annotate.selectedIds.filter((id) => present.has(id));
+  }
+
+  async function afterBulkChange(message, { affectsCurrent = true } = {}) {
+    await Promise.all([refreshFiles(), refreshProjectCounts()]);
+    annotate.selectedIds = selectedFileIds();
+    const current = annotate.current && files.rows.find((file) => file.id === annotate.current.id);
+    if (annotate.current && !current) {
+      annotate.current = null;
+      clearAnnotation();
+    } else if (current && affectsCurrent && !annotate.dirty) {
+      await selectAnnotateFile(current);
+    }
+    annotate.status = message;
+    projects.status = message;
+  }
+
+  async function clearSelectedAnnotations(mode) {
+    const fileIds = selectedFileIds();
+    if (!fileIds.length) return;
+    const question = mode === "all"
+      ? `清除所选 ${fileIds.length} 张图片的全部标注（包括人工确认过的）？这些图片会回到「未标注」。`
+      : `清除所选 ${fileIds.length} 张图片中未确认的 AI 结果？人工确认过的目标会保留，没有剩余目标的图片回到「未标注」。`;
+    if (!window.confirm(question)) return;
+    try {
+      const data = await apiFetch("/api/annotations/clear", { method: "POST", body: { projectId: projects.selectedId, fileIds, mode } });
+      await afterBulkChange(`已清除 ${data.images} 张图片的 ${data.targets} 个目标`);
+    } catch (error) {
+      annotate.status = error.message;
+      projects.status = error.message;
+    }
+  }
+
+  async function deleteSelectedFiles() {
+    const fileIds = selectedFileIds();
+    if (!fileIds.length) return;
+    if (!window.confirm(`删除所选 ${fileIds.length} 张图片？它们的标注也会一起删除，无法恢复。`)) return;
+    try {
+      const data = await apiFetch("/api/files/bulk-delete", { method: "POST", body: { projectId: projects.selectedId, fileIds } });
+      if (data.user) {
+        account.value = data.user;
+        saveSession({ ...session(), user: data.user });
+      }
+      clearFileSelection();
+      await afterBulkChange(`已删除 ${data.deleted} 张图片`);
+    } catch (error) {
+      annotate.status = error.message;
+      projects.status = error.message;
+    }
+  }
+
+  function markBackground() {
+    if (annotate.annotations.length) return;
+    annotate.background = true;
+    saveAnnotation();
+  }
+
+  function toggleAutoNext() {
+    annotate.autoNext = !annotate.autoNext;
+    localStorage.setItem("maskflow.autoNext", annotate.autoNext ? "1" : "0");
   }
 
   async function runMasks() {
@@ -2143,15 +2300,16 @@ export function useMaskFlowApp() {
       annotate.status = "已有批量标注任务在进行中";
       return;
     }
+    const fileIds = selectedFileIds();
     let scope = "unannotated";
-    if (!files.rows.some((file) => !file.annotated)) {
+    if (!fileIds.length && !files.rows.some((file) => !file.annotated)) {
       if (!window.confirm("所有图片都已有标注。重新运行会替换每张图中未确认的 AI 结果，已人工确认的目标会保留。是否继续？")) return;
       scope = "all";
     }
     try {
       const data = await apiFetch("/api/annotations/batch", {
         method: "POST",
-        body: { projectId: projects.selectedId, scope, ...aiRequestOptions() }
+        body: { projectId: projects.selectedId, scope, fileIds: fileIds.length ? fileIds : null, ...aiRequestOptions() }
       });
       applyBatchTask(data.task);
       scheduleBatchPoll();
@@ -2166,8 +2324,15 @@ export function useMaskFlowApp() {
     const fileId = annotate.current.id;
     const selection = annotationSelection;
     const revision = annotationEditRevision;
-    loading.value = true;
     const annotations = annotate.annotations.map(normalizeAnnotationItem);
+    let background = false;
+    if (!annotations.length) {
+      background = annotate.background || window.confirm("这张图没有任何目标。\n\n确定：标为「背景图」——已检查过、确实没有目标，训练时作为负样本。\n取消：清空标注，图片回到「未标注」。");
+    }
+    // Next image in the current queue, picked before saving moves this one out of a filtered view.
+    const queue = filteredFiles.value;
+    const nextId = annotate.autoNext ? queue[queue.findIndex((file) => file.id === fileId) + 1]?.id : null;
+    loading.value = true;
     normalizeAnnotationLabels(annotations);
     for (const item of annotations) item.confirmed = isExportableAnnotation(item);
     try {
@@ -2177,12 +2342,15 @@ export function useMaskFlowApp() {
           fileId,
           width: annotate.width,
           height: annotate.height,
-          annotations
+          annotations,
+          background
         }
       });
       if (selection === annotationSelection && revision === annotationEditRevision)
-        applyAnnotation(data.annotation, { status: "标注已保存" });
+        applyAnnotation(data.annotation, { status: background ? "已标为背景图（无目标）" : annotations.length ? "标注已保存" : "已清空，图片回到未标注" });
       await refreshFiles();
+      const next = nextId && files.rows.find((file) => file.id === nextId);
+      if (next && selection === annotationSelection) await selectAnnotateFile(next);
     } catch (error) {
       annotate.status = error.message;
     } finally {
@@ -2680,6 +2848,10 @@ export function useMaskFlowApp() {
       case "pointMode":
         togglePointPromptMode();
         return true;
+      case "runAi":
+        if (!canRunAnnotateAi.value || !annotate.current) return false;
+        runCurrentMask();
+        return true;
       case "enter":
         if (!annotate.pointMode || !annotate.pointDraft.candidates.length) return false;
         confirmAnnotatePointTarget();
@@ -3095,6 +3267,8 @@ export function useMaskFlowApp() {
     runSegment, selectSegmentFile, showSegmentOverlay, subscribe, saveSettings, changePassword,
     saveNotifications, createApiToken, revokeApiToken, revokeOAuthGrant, addTeamMember, removeTeamMember, revokeDevice,
     refreshExports, uploadDuplicatePrompt, resolveDuplicateUpload, importer, importDataset, downloadFileItem,
+    queueCounts, fileStatusText, fileStatusGroup, isFileSelected, toggleFileSelection, setAllSelected, clearFileSelection,
+    clearSelectedAnnotations, deleteSelectedFiles, markBackground, toggleAutoNext, dropFilesToProject,
     ...trainingApi
   };
   for (const [key, value] of Object.entries(providers)) {

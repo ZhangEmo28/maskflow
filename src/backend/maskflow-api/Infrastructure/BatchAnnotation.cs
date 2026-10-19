@@ -21,7 +21,8 @@ public sealed record BatchTaskInput(List<int> FileIds, string? Mode, double Conf
         root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 }
 
-public sealed record BatchProgress(int Processed, int Succeeded, int Failed, string? LastError)
+// NoTargets: images where AI ran fine but found nothing (they stay unannotated).
+public sealed record BatchProgress(int Processed, int Succeeded, int Failed, string? LastError, int NoTargets = 0)
 {
     public static readonly BatchProgress Empty = new(0, 0, 0, null);
 
@@ -31,6 +32,7 @@ public sealed record BatchProgress(int Processed, int Succeeded, int Failed, str
         ["processed"] = Processed,
         ["succeeded"] = Succeeded,
         ["failed"] = Failed,
+        ["noTargets"] = NoTargets,
         ["lastError"] = LastError
     };
 
@@ -40,6 +42,6 @@ public sealed record BatchProgress(int Processed, int Succeeded, int Failed, str
         var root = JsonSerializer.SerializeToElement(result);
         int Int(string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetInt32() : 0;
         var lastError = root.TryGetProperty("lastError", out var error) && error.ValueKind == JsonValueKind.String ? error.GetString() : null;
-        return new BatchProgress(Int("processed"), Int("succeeded"), Int("failed"), lastError);
+        return new BatchProgress(Int("processed"), Int("succeeded"), Int("failed"), lastError, Int("noTargets"));
     }
 }

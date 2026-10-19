@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject } from "vue";
+import { computed, inject, watch } from "vue";
 import LineChart from "../LineChart.vue";
 import { isActiveTraining, metricRows, trainingCurves, trainingStatusLabels, weightTaskLabels } from "../../lib/training";
 
@@ -21,6 +21,12 @@ const startTraining = inject("startTraining");
 const cancelTraining = inject("cancelTraining");
 const deleteTraining = inject("deleteTraining");
 const downloadTrainingArtifact = inject("downloadTrainingArtifact");
+const scheduleReadinessCheck = inject("scheduleReadinessCheck");
+
+watch(() => [projects.selectedId, training.form.baseWeight, training.form.split.train, training.form.split.val, training.form.split.test, training.form.confirmedOnly],
+  scheduleReadinessCheck);
+const readiness = computed(() => training.readiness);
+const blocked = computed(() => Boolean(readiness.value && (readiness.value.error || !readiness.value.ok)));
 
 const run = computed(() => training.detail?.training || null);
 const curves = computed(() => trainingCurves(training.detail?.history || [], run.value?.task));
@@ -109,13 +115,49 @@ function formatMetric(value) {
           </div>
           <label class="train-check"><input v-model="training.form.confirmedOnly" type="checkbox" />只用人工确认过的标注</label>
           <label>名称（可选）<input v-model="training.form.name" type="text" maxlength="200" :placeholder="selectedProject ? `${selectedProject.name} · ${training.form.baseWeight.replace(/\.pt$/, '')}` : ''" /></label>
-          <button class="btn" type="button" :disabled="!canTrain || training.busy || !projects.selectedId || !training.form.baseWeight" @click="startTraining">
+          <button class="btn" type="button" :disabled="!canTrain || training.busy || !projects.selectedId || !training.form.baseWeight || blocked" :title="blocked ? '数据检查未通过，见右侧说明' : ''" @click="startTraining">
             {{ training.busy ? '正在提交…' : '开始训练' }}
           </button>
           <p v-if="!canTrain && projects.selectedId" class="train-hint">只有项目所有者和审核员可以发起训练。</p>
           <p v-else class="train-hint">划分方式与数据集导出相同（按类别分层、相似图片分到同一组）。验证集用于挑选最佳权重，测试集只在最后评估一次。</p>
         </article>
 
+        <article class="work-card train-check">
+          <div class="section-head">
+            <h2>数据检查</h2>
+            <span v-if="training.checking" class="train-hint">检查中…</span>
+          </div>
+          <p v-if="!projects.selectedId" class="train-hint">先选择一个项目。</p>
+          <p v-else-if="readiness?.error" class="train-notice fail">{{ readiness.error }}</p>
+          <template v-else-if="readiness">
+            <p :class="['train-verdict', readiness.ok ? 'ok' : 'fail']">
+              {{ readiness.ok ? '可以开始训练' : '还不能训练' }}
+              <small>{{ readiness.images }} 张可训练图片（训练 {{ readiness.train }} / 验证 {{ readiness.val }} / 测试 {{ readiness.test }}）<template v-if="readiness.backgroundImages"> · 背景图 {{ readiness.backgroundImages }}</template><template v-if="readiness.unannotatedImages"> · 未标注 {{ readiness.unannotatedImages }} 张不参与</template></small>
+            </p>
+            <ul v-if="readiness.blockers.length" class="train-list fail"><li v-for="item in readiness.blockers" :key="item">{{ item }}</li></ul>
+            <ul v-if="readiness.warnings.length" class="train-list warn"><li v-for="item in readiness.warnings" :key="item">{{ item }}</li></ul>
+            <div v-if="readiness.suggestions.length" class="train-suggest">
+              <strong>建议补充</strong>
+              <ul class="train-list"><li v-for="item in readiness.suggestions" :key="item">{{ item }}</li></ul>
+            </div>
+            <table v-if="readiness.classes.length" class="table train-classes">
+              <thead><tr><th>类别</th><th>图片</th><th>目标</th><th>训练 / 验证 / 测试</th><th>建议补充</th></tr></thead>
+              <tbody>
+                <tr v-for="row in readiness.classes" :key="row.label" :class="{ short: row.images < readiness.thresholds.minImagesPerClass }">
+                  <td>{{ row.label }}</td>
+                  <td>{{ row.images }}</td>
+                  <td>{{ row.instances }}</td>
+                  <td>{{ row.train }} / {{ row.val }} / {{ row.test }}</td>
+                  <td>{{ row.addImages ? `+${row.addImages}` : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="train-hint">至少 {{ readiness.thresholds.minImages }} 张已标注图片、每类至少 {{ readiness.thresholds.minImagesPerClass }} 张才能训练；每类 {{ readiness.thresholds.recommendedPerClass }} 张以上、类别间不超过 3:1 效果更稳定。</p>
+          </template>
+        </article>
+      </section>
+
+      <section class="train-runs-row">
         <article class="work-card train-runs">
           <div class="section-head">
             <h2>训练记录</h2>
