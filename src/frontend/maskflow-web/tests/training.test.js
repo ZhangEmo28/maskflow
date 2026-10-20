@@ -33,7 +33,8 @@ test("groups result images and pairs predictions with labels", () => {
   const names = [
     "dataset.zip", "train/weights/best.pt", "train/results.png", "train/labels.jpg", "train/train_batch0.jpg",
     "val/confusion_matrix.png", "val/confusion_matrix_normalized.png", "val/BoxPR_curve.png", "val/BoxF1_curve.png",
-    "val/val_batch0_labels.jpg", "val/val_batch0_pred.jpg", "val/val_batch1_pred.jpg", "test/confusion_matrix.png", "misc.png"
+    "val/val_batch0_labels.jpg", "val/val_batch0_pred.jpg", "val/val_batch1_pred.jpg", "test/confusion_matrix.png", "misc.png",
+    "train/val_batch0_labels.jpg", "train/val_batch0_pred.jpg"
   ];
   const sections = groupResultImages(names.map((name) => ({ name })));
   const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
@@ -45,6 +46,7 @@ test("groups result images and pairs predictions with labels", () => {
   assert.deepEqual(byKey.confusion.items, ["val/confusion_matrix_normalized.png", "val/confusion_matrix.png", "test/confusion_matrix.png"]);
   assert.deepEqual(byKey.metricCurves.items, ["val/BoxPR_curve.png", "val/BoxF1_curve.png"]);
   assert.deepEqual(byKey.other.items, ["misc.png"]);
+  assert.deepEqual(byKey.trainValPredictions.pairs, [{ pred: "train/val_batch0_pred.jpg", labels: "train/val_batch0_labels.jpg", title: "val_batch0" }]);
   assert.equal(sections.some((section) => section.key === "testPredictions"), false);
   assert.equal(describeArtifact("base/yolo26n.pt"), "基础权重 yolo26n.pt");
 });

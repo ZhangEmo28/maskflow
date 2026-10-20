@@ -7807,7 +7807,9 @@ body:has(.app-sidebar) {
 }
 
 .train-file-table td:last-child {
-  width: 60px;
+  width: 64px;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .lightbox figure {
