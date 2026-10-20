@@ -190,7 +190,8 @@ def test_full_run_trains_evaluates_exports_and_serves_artifacts(dirs):
 
     args = json.loads((dirs["runs"] / "run_1" / "train" / "fake_args.json").read_text())
     data_yaml = Path(args["data"])
-    assert args["weights"] == str(dirs["weights"] / "yolo11n.pt")
+    # Each run trains from its own copy of the base weight, which ends up in the run's files.
+    assert args["weights"] == str(dirs["runs"] / "run_1" / "base" / "yolo11n.pt")
     assert (args["imgsz"], args["batch"], args["patience"], args["device"]) == (320, 4, 5, None)
     # `path: .` is rewritten to the extracted absolute directory so Ultralytics finds the images.
     assert f"path: {data_yaml.parent.resolve().as_posix()}" in data_yaml.read_text()
@@ -290,3 +291,94 @@ def test_non_finite_values_never_reach_json(tmp_path):
     (tmp_path / "train").mkdir()
     (tmp_path / "train" / "results.csv").write_text("epoch,train/box_loss\n1,nan\n2,0.5\n")
     assert trainer.read_history(tmp_path) == [{"epoch": 1.0}, {"epoch": 2.0, "train/box_loss": 0.5}]
+
+
+def zip_bytes(size_hint=0):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("archive/data.pkl", b"x" * size_hint)
+    return buffer.getvalue()
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def wait_download(name, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = trainer._downloads.get(name)
+        if state and state["done"]:
+            return state
+        time.sleep(0.05)
+    raise AssertionError("download did not finish")
+
+
+def test_catalog_lists_official_weights_with_install_state(dirs):
+    body = client.get("/api/weights", headers=HEADERS).json()
+    catalog = {item["name"]: item for item in body["catalog"]}
+    assert len(catalog) == 45 and body["writable"] is True
+    assert catalog["yolo11n.pt"]["installed"] is True
+    assert catalog["yolo26n-seg.pt"]["task"] == "segment" and catalog["yolo26n-seg.pt"]["installed"] is False
+    assert catalog["yolo26x.pt"]["url"].endswith("/v8.4.0/yolo26x.pt")
+    assert catalog["yolo26x.pt"]["family"] == "YOLO26"
+
+
+def test_downloads_catalog_weights_and_checks_them(dirs, monkeypatch):
+    payload = zip_bytes(1000)
+    monkeypatch.setitem(trainer._CATALOG_SIZES, "yolo26n.pt", len(payload))
+    monkeypatch.setattr(trainer, "_downloads", {})
+    requested = []
+    monkeypatch.setattr(trainer, "_open_url", lambda url: requested.append(url) or FakeResponse(payload))
+
+    assert client.post("/api/weights/yolo26n.pt/download", headers=HEADERS).status_code == 200
+    assert wait_download("yolo26n.pt")["error"] is None
+    assert (dirs["weights"] / "yolo26n.pt").read_bytes() == payload
+    assert requested == ["https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt"]
+    assert any(w["name"] == "yolo26n.pt" for w in client.get("/api/weights", headers=HEADERS).json()["weights"])
+
+    # Truncated or non-checkpoint files are rejected and leave nothing behind.
+    monkeypatch.setitem(trainer._CATALOG_SIZES, "yolo26s.pt", len(payload) + 10)
+    monkeypatch.setattr(trainer, "_open_url", lambda url: FakeResponse(payload))
+    client.post("/api/weights/yolo26s.pt/download", headers=HEADERS)
+    assert "不完整" in wait_download("yolo26s.pt")["error"]
+    monkeypatch.setitem(trainer._CATALOG_SIZES, "yolo26m.pt", 20)
+    monkeypatch.setattr(trainer, "_open_url", lambda url: FakeResponse(b"<html>not a weight</html>"[:20]))
+    client.post("/api/weights/yolo26m.pt/download", headers=HEADERS)
+    assert "不是有效" in wait_download("yolo26m.pt")["error"]
+    assert not any(p.name.startswith(("yolo26s", "yolo26m")) for p in dirs["weights"].iterdir())
+    failed = {item["name"]: item for item in client.get("/api/weights", headers=HEADERS).json()["catalog"]}
+    assert failed["yolo26s.pt"]["download"]["error"]
+
+    assert client.post("/api/weights/evil.pt/download", headers=HEADERS).status_code == 404
+
+
+def test_delete_weights_but_not_while_training(dirs, monkeypatch):
+    assert client.delete("/api/weights/yolo11s-seg.pt", headers=HEADERS).json() == {"deleted": True}
+    assert not (dirs["weights"] / "yolo11s-seg.pt").exists()
+    assert client.delete("/api/weights/../x.pt", headers=HEADERS).status_code == 404
+
+    monkeypatch.setenv("FAKE_YOLO_MODE", "sleep")
+    assert start().status_code == 200
+    wait_for("run_1", phases=("training",))
+    assert client.delete("/api/weights/yolo11n.pt", headers=HEADERS).status_code == 409
+    client.post("/api/train/run_1/cancel", headers=HEADERS)
+
+
+def test_run_files_cover_everything_but_internals(dirs):
+    assert start().status_code == 200
+    assert wait_for("run_1")["phase"] == "completed"
+    files = {item["path"] for item in client.get("/api/train/run_1/files", headers=HEADERS).json()["files"]}
+    assert {"base/yolo11n.pt", "train/weights/best.pt", "train/weights/last.pt", "train/weights/best.onnx", "train/results.csv",
+            "val/confusion_matrix.png", "metrics.json", "train.log", "environment.json"} <= files
+    assert not any(path.startswith("data/") or path in {"config.json", "status.json"} for path in files)
+
+    environment = json.loads(client.get("/api/train/run_1/files/environment.json", headers=HEADERS).content)
+    assert environment["baseWeight"] == "yolo11n.pt" and len(environment["baseWeightSha256"]) == 64
+    assert client.get("/api/train/run_1/files/base/yolo11n.pt", headers=HEADERS).content == b"w" * 10
+    for bad in ("config.json", "data/data.yaml", "../run_1/config.json", "%2e%2e/%2e%2e/etc/passwd"):
+        assert client.get(f"/api/train/run_1/files/{bad}", headers=HEADERS).status_code == 404

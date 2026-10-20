@@ -49,3 +49,57 @@ export function metricRows(split, task = "detect") {
     : [["mAP50", `metrics/mAP50${suffix}`], ["mAP50-95", `metrics/mAP50-95${suffix}`], ["精确率 Precision", `metrics/precision${suffix}`], ["召回率 Recall", `metrics/recall${suffix}`]];
   return rows.filter(([, key]) => Number.isFinite(overall[key])).map(([label, key]) => ({ label, value: overall[key] }));
 }
+
+const IMAGE_EXTENSIONS = /\.(png|jpe?g)$/i;
+
+function baseName(path) {
+  return path.split("/").pop();
+}
+
+// Groups the result images Ultralytics produces into sections for the gallery. Prediction samples
+// come as pairs (…_labels.jpg = human labels, …_pred.jpg = model output) and are shown side by side.
+export function groupResultImages(artifacts = []) {
+  const images = artifacts.map((item) => item.name).filter((name) => IMAGE_EXTENSIONS.test(name));
+  const used = new Set();
+  const take = (predicate) => images.filter((name) => !used.has(name) && predicate(name)).map((name) => {
+    used.add(name);
+    return name;
+  });
+  // Validation before test, and the normalized matrix (easier to read) before raw counts.
+  const confusionRank = (name) => (name.startsWith("test/") ? 2 : 0) + (/normalized/i.test(name) ? 0 : 1);
+  const pairs = (split) => take((name) => name.startsWith(`${split}/`) && /_batch\d+_pred\.jpe?g$/i.test(name)).map((pred) => {
+    const labels = pred.replace(/_pred(\.jpe?g)$/i, "_labels$1");
+    if (images.includes(labels)) used.add(labels);
+    return { pred, labels: images.includes(labels) ? labels : null, title: baseName(pred).replace(/_pred\.jpe?g$/i, "") };
+  });
+
+  const sections = [
+    { key: "predictions", title: "预测效果（验证集：左为人工标注，右为模型预测）", pairs: pairs("val") },
+    { key: "testPredictions", title: "预测效果（测试集）", pairs: pairs("test") },
+    { key: "curves", title: "训练曲线", items: take((name) => /(^|\/)results\.png$/i.test(name)) },
+    { key: "confusion", title: "混淆矩阵", items: take((name) => /confusion_matrix/i.test(baseName(name))).sort((a, b) => confusionRank(a) - confusionRank(b)) },
+    { key: "metricCurves", title: "PR / F1 / 精确率 / 召回率曲线", items: take((name) => /(PR|F1|P|R)_curve\.png$/i.test(baseName(name))) },
+    { key: "labels", title: "标签分布", items: take((name) => /^labels/i.test(baseName(name))) },
+    { key: "trainBatches", title: "训练样本（数据增强后）", items: take((name) => /^train_batch/i.test(baseName(name))) },
+    { key: "other", title: "其他图片", items: take(() => true) }
+  ];
+  return sections.filter((section) => (section.pairs || section.items).length);
+}
+
+// Human-readable names for the files of a run.
+export function describeArtifact(name) {
+  const known = {
+    "dataset.zip": "本次训练的数据集",
+    "train/weights/best.pt": "最佳权重 best.pt（推荐）",
+    "train/weights/last.pt": "最后一轮权重 last.pt",
+    "train/weights/best.onnx": "ONNX 模型（可用于自动标注）",
+    "train/results.csv": "每轮指标 results.csv",
+    "train/args.yaml": "完整训练参数 args.yaml",
+    "metrics.json": "评估结果 metrics.json",
+    "train.log": "训练日志",
+    "environment.json": "软硬件环境"
+  };
+  if (known[name]) return known[name];
+  if (name.startsWith("base/")) return `基础权重 ${baseName(name)}`;
+  return name;
+}

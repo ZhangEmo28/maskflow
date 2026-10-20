@@ -32,6 +32,7 @@ public sealed class FakeTrainer : HttpMessageHandler, IHttpClientFactory
     public List<string> Calls { get; } = [];
     public string? Running { get; set; }
     public bool Down { get; set; }
+    public List<string> Installed { get; } = ["yolo11n.pt", "yolo11n-seg.pt", "yolo11n-cls.pt", "yolo11n-pose.pt"];
 
     public HttpClient CreateClient(string name) => new(this, disposeHandler: false) { BaseAddress = new Uri("http://trainer.test") };
 
@@ -44,7 +45,29 @@ public sealed class FakeTrainer : HttpMessageHandler, IHttpClientFactory
         switch (request.Method.Method, parts)
         {
             case ("GET", ["api", "weights"]):
-                return Json(new { weights = Weights, directory = "/weights" });
+                return Json(new
+                {
+                    weights = Weights.Where(x => Installed.Contains((string)x.GetType().GetProperty("name")!.GetValue(x)!)),
+                    catalog = new[] { "yolo26n.pt", "yolo11n.pt" }.Select(name => new
+                    {
+                        name, family = "YOLO26", scale = "n", task = "detect", size = 5_544_453, url = $"https://example.test/{name}",
+                        installed = Installed.Contains(name), download = (object?)null
+                    }),
+                    directory = "/weights", writable = true, inUse = (string?)null
+                });
+            case ("POST", ["api", "weights", var name, "download"]):
+                if (!Installed.Contains(name)) Installed.Add(name);
+                return Json(new { name, installed = true });
+            case ("DELETE", ["api", "weights", var name]):
+                return Installed.Remove(name) ? Json(new { deleted = true }) : Json(new { detail = "基础权重不存在" }, HttpStatusCode.NotFound);
+            case ("GET", ["api", "train", var id, "files"]):
+                return Runs.TryGetValue(id, out var listed)
+                    ? Json(new { files = listed.Artifacts.Select(x => new { path = x.Key, size = x.Value.Length }) })
+                    : Json(new { detail = "Run not found." }, HttpStatusCode.NotFound);
+            case ("GET", ["api", "train", var id, "files", .. var rest]):
+                return Runs.TryGetValue(id, out var source) && source.Artifacts.TryGetValue(string.Join('/', rest.Select(Uri.UnescapeDataString)), out var content)
+                    ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(content) }
+                    : Json(new { detail = "File not found." }, HttpStatusCode.NotFound);
             case ("GET", ["api", "status"]):
                 return Json(new { running = Running });
             case ("POST", ["api", "train"]):
@@ -102,10 +125,15 @@ public sealed class FakeTrainer : HttpMessageHandler, IHttpClientFactory
             },
             onnx = "best.onnx"
         };
+        // The same layout the real trainer produces (paths relative to the run directory).
         run.Artifacts = new()
         {
-            ["best.pt"] = new byte[1000], ["last.pt"] = new byte[1000], ["best.onnx"] = new byte[800],
-            ["results.csv"] = Encoding.UTF8.GetBytes("epoch,metrics/mAP50(B)\n1,0.2\n"), ["confusion_matrix.png"] = new byte[50], ["metrics.json"] = Encoding.UTF8.GetBytes("{}")
+            ["base/yolo11n.pt"] = new byte[300],
+            ["train/weights/best.pt"] = new byte[1000], ["train/weights/last.pt"] = new byte[1000], ["train/weights/best.onnx"] = new byte[800],
+            ["train/results.csv"] = Encoding.UTF8.GetBytes("epoch,metrics/mAP50(B)\n1,0.2\n"), ["train/results.png"] = new byte[40], ["train/args.yaml"] = Encoding.UTF8.GetBytes("epochs: 3\n"),
+            ["val/confusion_matrix.png"] = new byte[50], ["val/val_batch0_pred.jpg"] = new byte[60], ["val/val_batch0_labels.jpg"] = new byte[60],
+            ["metrics.json"] = Encoding.UTF8.GetBytes("{}"), ["train.log"] = Encoding.UTF8.GetBytes("done\n"),
+            ["environment.json"] = Encoding.UTF8.GetBytes("""{"ultralytics":"8.4.140","torch":"2.9.1","cuda":"12.8","gpu":"RTX 4090","baseWeight":"yolo11n.pt","baseWeightSha256":"abc"}""")
         };
         run.Phase = "completed";
         if (Running == id) Running = null;
@@ -117,7 +145,7 @@ public sealed class FakeTrainer : HttpMessageHandler, IHttpClientFactory
 
 public class TrainingTests
 {
-    static async Task<(MaskFlowStore Store, User Owner, Project Project, FakeTrainer Trainer, TrainingWorker Worker, FakeEmailSender Mail)> SetupAsync(
+    internal static async Task<(MaskFlowStore Store, User Owner, Project Project, FakeTrainer Trainer, TrainingWorker Worker, FakeEmailSender Mail)> SetupAsync(
         int images = 24, string dataType = "detection")
     {
         var (store, _) = TestStore.Create();
@@ -145,7 +173,7 @@ public class TrainingTests
 
     static ProjectAccess Owner(MaskFlowStore store, User owner, Project project) => store.RequireProjectAccess(owner.Id, project.Id, Permissions.Export);
 
-    static async Task<TrainingRun> QueueAsync(MaskFlowStore store, User owner, Project project, FakeTrainer trainer, TrainingRequest? request = null)
+    internal static async Task<TrainingRun> QueueAsync(MaskFlowStore store, User owner, Project project, FakeTrainer trainer, TrainingRequest? request = null)
     {
         var weights = await new TrainingWorker(store, trainer, null!, NullLogger<TrainingWorker>.Instance).ListWeightsAsync(CancellationToken.None);
         request ??= new TrainingRequest("yolo11n.pt", Epochs: 3, ImageSize: 320, Batch: 4);
@@ -222,7 +250,11 @@ public class TrainingTests
 
         var done = store.GetTrainingRun(run.Id)!;
         Assert.Equal(("completed", 3, null), (done.Status, done.Epoch, done.Error));
-        Assert.Equal(["best.pt", "best.onnx", "results.csv", "confusion_matrix.png", "metrics.json"], done.Artifacts.Select(x => x.Name));
+        Assert.Equal("dataset.zip", done.Artifacts[0].Name);
+        Assert.Equal(trainer.Uploads[run.Id].Dataset, await File.ReadAllBytesAsync(done.Artifacts[0].Path));
+        Assert.Contains("train/weights/best.pt", done.Artifacts.Select(x => x.Name));
+        Assert.Contains("base/yolo11n.pt", done.Artifacts.Select(x => x.Name));
+        Assert.Equal(14, done.Artifacts.Count);
         Assert.All(done.Artifacts, x => Assert.True(File.Exists(x.Path)));
         Assert.Equal(0.41, MaskFlowStore.TrainingHeadline(done)["mAP50-95"]);
         Assert.Equal(0.6, MaskFlowStore.TrainingHeadline(done)["mAP50"]);
@@ -353,9 +385,10 @@ public class TrainingTests
         var failed = store.GetTrainingRun(run.Id)!;
         Assert.Equal("failed", failed.Status);
         Assert.Contains("存储空间不足", failed.Error);
-        Assert.Empty(failed.Artifacts);
+        // Only the dataset copy kept at upload time remains; the collected results were removed.
+        Assert.Equal(["dataset.zip"], failed.Artifacts.Select(x => x.Name));
         var trainingDir = Path.Combine(store.StorageRoot, owner.Id.ToString(), "trainings", run.Id);
-        Assert.True(!Directory.Exists(trainingDir) || Directory.GetFiles(trainingDir).Length == 0);
+        Assert.Equal(["dataset.zip"], Directory.GetFiles(trainingDir, "*", SearchOption.AllDirectories).Select(Path.GetFileName));
     }
 
     [Fact]
@@ -381,5 +414,102 @@ public class TrainingTests
         await store.RequeueInterruptedTrainingsAsync();
 
         Assert.Equal(("queued", (DateTimeOffset?)null), (store.GetTrainingRun(run.Id)!.Status, store.GetTrainingRun(run.Id)!.StartedAt));
+    }
+}
+
+public class TrainingPackageTests
+{
+    [Fact]
+    public async Task Bundle_ContainsBaseWeightDatasetScriptsAndEveryResult()
+    {
+        var (store, owner, project, trainer, worker, _) = await TrainingTests.SetupAsync();
+        var run = await TrainingTests.QueueAsync(store, owner, project, trainer);
+        await worker.RunOnceAsync(CancellationToken.None);
+        trainer.Complete(run.Id);
+        await worker.RunOnceAsync(CancellationToken.None);
+        var done = store.GetTrainingRun(run.Id)!;
+
+        var path = await store.BuildTrainingBundleAsync(done, CancellationToken.None);
+        try
+        {
+            using var zip = ZipFile.OpenRead(path);
+            var names = zip.Entries.Select(x => x.FullName).ToHashSet();
+            Assert.Superset(new HashSet<string>
+            {
+                "README.md", "train.py", "predict.py", "requirements.txt", "training.json",
+                "base/yolo11n.pt", "dataset/data.yaml", "dataset/split-report.json",
+                "runs/train/weights/best.pt", "runs/train/weights/last.pt", "runs/train/weights/best.onnx",
+                "runs/train/results.csv", "runs/train/args.yaml", "runs/val/val_batch0_pred.jpg", "runs/train.log", "runs/environment.json"
+            }, names);
+            Assert.Contains(names, x => x.StartsWith("dataset/images/train/"));
+            Assert.DoesNotContain("runs/dataset.zip", names);
+
+            string Read(string name)
+            {
+                using var reader = new StreamReader(zip.GetEntry(name)!.Open());
+                return reader.ReadToEnd();
+            }
+
+            var readme = Read("README.md");
+            Assert.Contains("| mAP50-95 | 0.41 |", readme);
+            Assert.Contains("Ultralytics 8.4.140", readme);
+            var train = Read("train.py");
+            Assert.Contains("BASE_WEIGHT = ROOT / \"base\" / \"yolo11n.pt\"", train);
+            Assert.Contains("epochs\", type=int, default=3", train);
+            Assert.Contains("imgsz=320", train);
+            Assert.Contains("ultralytics==8.4.140", Read("requirements.txt"));
+            Assert.Equal(run.Id, JsonDocument.Parse(Read("training.json")).RootElement.GetProperty("id").GetString());
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task OnlyTheFirstAccountManagesBaseWeightsByDefault()
+    {
+        var (store, _) = TestStore.Create();
+        var first = await TestStore.RegisterAsync(store, "first@example.com");
+        var second = await TestStore.RegisterAsync(store, "second@example.com");
+        Assert.True(store.CanManageBaseWeights(first));
+        Assert.False(store.CanManageBaseWeights(second));
+    }
+
+    [Theory]
+    [InlineData("train/weights/best.pt", true)]
+    [InlineData("base/yolo11n.pt", true)]
+    [InlineData("../secret", false)]
+    [InlineData("train/../../x", false)]
+    [InlineData("/etc/passwd", false)]
+    [InlineData("a\\b", false)]
+    [InlineData("a//b", false)]
+    public void ArtifactPaths_AreValidated(string path, bool safe)
+    {
+        Assert.Equal(safe, MaskFlowStore.IsSafeArtifactPath(path));
+    }
+}
+
+public class WeightManagementTests(McpApp app) : IClassFixture<McpApp>
+{
+    [Fact]
+    public async Task AdminDownloadsAndDeletesWeights_OthersOnlyLook()
+    {
+        var admin = await app.SignUpAsync("admin");
+        var member = await app.SignUpAsync("member");
+
+        var overview = await admin.Json(await admin.Get("/api/training/weights"));
+        Assert.True(overview.GetProperty("canManage").GetBoolean());
+        Assert.Contains(overview.GetProperty("catalog").EnumerateArray(), x => x.GetProperty("name").GetString() == "yolo26n.pt" && !x.GetProperty("installed").GetBoolean());
+        Assert.False((await member.Json(await member.Get("/api/training/weights"))).GetProperty("canManage").GetBoolean());
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await member.Post("/api/training/weights/yolo26n.pt/download")).StatusCode);
+        (await admin.Post("/api/training/weights/yolo26n.pt/download")).EnsureSuccessStatusCode();
+        Assert.Contains("yolo26n.pt", app.Trainer.Installed);
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await member.Delete("/api/training/weights/yolo26n.pt")).StatusCode);
+        (await admin.Delete("/api/training/weights/yolo26n.pt")).EnsureSuccessStatusCode();
+        Assert.DoesNotContain("yolo26n.pt", app.Trainer.Installed);
+        Assert.Equal(HttpStatusCode.NotFound, (await admin.Delete("/api/training/weights/yolo26n.pt")).StatusCode);
     }
 }

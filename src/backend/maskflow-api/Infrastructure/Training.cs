@@ -8,9 +8,28 @@ public sealed partial class MaskFlowStore
     public static readonly string[] ActiveTrainingStatuses = ["queued", "preparing", "training", "evaluating", "exporting"];
     // Statuses in which the trainer service owns the run and the worker polls it.
     public static readonly string[] RemoteTrainingStatuses = ["training", "evaluating", "exporting"];
-    // Kept after a run; last.pt is left out to save space.
-    public static readonly string[] TrainingArtifactNames =
-        ["best.pt", "best.onnx", "results.csv", "results.png", "confusion_matrix.png", "confusion_matrix_normalized.png", "metrics.json"];
+    public const string DatasetArtifact = "dataset.zip";
+
+    // Base weights are shared by the whole deployment, so only administrators download or delete them:
+    // the emails in MASKFLOW_ADMIN_EMAILS, or, when unset, the first account (the one who set it up).
+    public bool CanManageBaseWeights(User user)
+    {
+        var configured = (Environment.GetEnvironmentVariable("MASKFLOW_ADMIN_EMAILS") ?? "")
+            .Split([',', ';', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return configured.Length > 0
+            ? configured.Contains(user.Email, StringComparer.OrdinalIgnoreCase)
+            : State.Users.Count > 0 && State.Users.Min(x => x.Id) == user.Id;
+    }
+
+    // Artifacts are stored under their path in the run ("train/weights/best.pt"). Runs from before
+    // this layout used bare file names, so a bare name also matches the end of a path.
+    public static TrainingArtifact? FindArtifact(TrainingRun run, string path) =>
+        run.Artifacts.FirstOrDefault(x => x.Name == path)
+        ?? run.Artifacts.FirstOrDefault(x => !x.Name.Contains('/') && x.Name == Path.GetFileName(path));
+
+    public static bool IsSafeArtifactPath(string? path) =>
+        !string.IsNullOrWhiteSpace(path) && path.Length <= 300 && !path.StartsWith('/') && !path.Contains('\\')
+        && path.Split('/').All(part => part.Length > 0 && part != "." && part != "..");
 
     public static bool IsActiveTraining(TrainingRun run) => ActiveTrainingStatuses.Contains(run.Status);
 
@@ -137,6 +156,7 @@ public sealed partial class MaskFlowStore
 
     public async Task<string> PersistTrainingArtifactAsync(TrainingRun run, string name, string localPath)
     {
+        if (!IsSafeArtifactPath(name)) throw new InvalidDataException($"Unsafe artifact path: {name}");
         var key = $"users/{run.UserId}/trainings/{run.Id}/{name}";
         if (UseMinio)
         {
@@ -150,9 +170,8 @@ public sealed partial class MaskFlowStore
             return $"minio://{MinioBucket}/{key}";
         }
 
-        var directory = Path.Combine(StorageRoot, run.UserId.ToString(), "trainings", run.Id);
-        Directory.CreateDirectory(directory);
-        var path = Path.Combine(directory, name);
+        var path = Path.Combine(StorageRoot, run.UserId.ToString(), "trainings", run.Id, name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.Copy(localPath, path, overwrite: true);
         return path;
     }
@@ -160,6 +179,9 @@ public sealed partial class MaskFlowStore
     public static string ArtifactContentType(string name) => Path.GetExtension(name).ToLowerInvariant() switch
     {
         ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".yaml" or ".txt" or ".log" => "text/plain; charset=utf-8",
+        ".zip" => "application/zip",
         ".csv" => "text/csv",
         ".json" => "application/json",
         _ => "application/octet-stream"
@@ -186,11 +208,40 @@ public sealed partial class MaskFlowStore
             EnsureStorageAvailable(owner, bytes);
             result = run with
             {
-                Status = "completed", Artifacts = artifacts, Metrics = metrics, History = history, Epoch = history.Count,
+                Status = "completed", Artifacts = [.. run.Artifacts.Where(x => artifacts.All(a => a.Name != x.Name)), .. artifacts],
+                Metrics = metrics, History = history, Epoch = history.Count,
                 Error = null, FinishedAt = DateTimeOffset.UtcNow
             };
             State.TrainingRuns[index] = result;
             ReplaceUser(owner with { UsedBytes = owner.UsedBytes + bytes });
+        });
+        return result;
+    }
+
+    // The exact dataset a run trains on is kept with it (counted against the owner's storage), so the
+    // training package can reproduce the run even after annotations change.
+    public async Task<TrainingRun?> AttachTrainingArtifactAsync(string id, TrainingArtifact artifact)
+    {
+        TrainingRun? result = null;
+        await SaveAsync(() =>
+        {
+            deleteOnRollback.Add(artifact.Path);
+            var index = State.TrainingRuns.FindIndex(x => x.Id == id);
+            if (index < 0 || !IsActiveTraining(State.TrainingRuns[index]))
+            {
+                deleteAfterCommit.Add(artifact.Path);
+                return;
+            }
+
+            var run = State.TrainingRuns[index];
+            var owner = GetUser(run.UserId)!;
+            var replaced = run.Artifacts.Where(x => x.Name == artifact.Name).ToList();
+            var bytes = artifact.Size - replaced.Sum(x => x.Size);
+            EnsureStorageAvailable(owner, Math.Max(0, bytes));
+            // A retried upload replaces the earlier copy (same storage key, so nothing to delete).
+            result = run with { Artifacts = [.. run.Artifacts.Where(x => x.Name != artifact.Name), artifact] };
+            State.TrainingRuns[index] = result;
+            ReplaceUser(owner with { UsedBytes = Math.Max(0, owner.UsedBytes + bytes) });
         });
         return result;
     }
