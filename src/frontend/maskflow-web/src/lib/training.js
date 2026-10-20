@@ -76,6 +76,8 @@ export function groupResultImages(artifacts = []) {
   const sections = [
     { key: "predictions", title: "预测效果（验证集：左为人工标注，右为模型预测）", pairs: pairs("val") },
     { key: "testPredictions", title: "预测效果（测试集）", pairs: pairs("test") },
+    // Ultralytics also validates once at the end of training and keeps those samples in train/.
+    { key: "trainValPredictions", title: "训练结束时的验证样例（左为人工标注，右为模型预测）", pairs: pairs("train") },
     { key: "curves", title: "训练曲线", items: take((name) => /(^|\/)results\.png$/i.test(name)) },
     { key: "confusion", title: "混淆矩阵", items: take((name) => /confusion_matrix/i.test(baseName(name))).sort((a, b) => confusionRank(a) - confusionRank(b)) },
     { key: "metricCurves", title: "PR / F1 / 精确率 / 召回率曲线", items: take((name) => /(PR|F1|P|R)_curve\.png$/i.test(baseName(name))) },
