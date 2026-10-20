@@ -222,6 +222,24 @@ public class McpEndpointTests(McpApp app) : IClassFixture<McpApp>
         Assert.Equal(2, evaluation.GetProperty("worstImages").GetArrayLength());
         var models = await Call(mcp, "list_models", new { project_id = projectId });
         Assert.Equal(trainingId, models.GetProperty("models")[0].GetProperty("trainingId").GetString());
+
+        // Download links work without the auth header (browser download manager), only for their target.
+        var link = (await user.Json(await user.Post($"/api/trainings/{trainingId}/download-link"))).GetProperty("url").GetString()!;
+        var anonymous = app.CreateClient();
+        var bundle = await anonymous.GetAsync(link);
+        Assert.Equal(HttpStatusCode.OK, bundle.StatusCode);
+        Assert.Equal("application/zip", bundle.Content.Headers.ContentType!.MediaType);
+        using (var zip = new System.IO.Compression.ZipArchive(await bundle.Content.ReadAsStreamAsync()))
+        {
+            Assert.Contains(zip.Entries, x => x.FullName == "runs/train/weights/best.pt");
+        }
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync(link[..^2] + "00")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync(link.Replace("/bundle?", "/artifacts/train/weights/best.pt?"))).StatusCode);
+        var weightLink = (await user.Json(await user.Post($"/api/trainings/{trainingId}/download-link?path=train/weights/best.pt"))).GetProperty("url").GetString()!;
+        Assert.Equal(1000, (await anonymous.GetByteArrayAsync(weightLink)).Length);
+        var stranger = await app.SignUpAsync("outsider");
+        Assert.Equal(HttpStatusCode.NotFound, (await stranger.Post($"/api/trainings/{trainingId}/download-link")).StatusCode);
     }
 
     static async Task WaitForAsync(Func<Task<bool>> condition, TrainingWorker worker)

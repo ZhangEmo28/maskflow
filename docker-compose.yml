@@ -34,7 +34,7 @@ services:
     restart: unless-stopped
 
   # 模型训练（可选，需要 GPU）：docker compose --profile training up -d
-  # 基础权重（yolo11n.pt、yolo11n-seg.pt、yolo11n-cls.pt 等）预先下载到 ./资源/训练权重
+  # 基础权重在训练页「基础权重」一键下载，或手动放到 ./资源/训练权重
   trainer:
     profiles: ["training"]
     build:
@@ -49,10 +49,13 @@ services:
       TRAIN_WEIGHTS_DIR: /weights
       TRAIN_RUNS_DIR: /runs
       YOLO_CONFIG_DIR: /runs/.ultralytics
+      # 访问 GitHub 慢时可换成 ultralytics/assets v8.4.0 发布页的镜像地址
+      TRAIN_WEIGHT_BASE_URL: ${TRAIN_WEIGHT_BASE_URL:-https://github.com/ultralytics/assets/releases/download/v8.4.0}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      - ./资源/训练权重:/weights:ro
+      # 可写：训练页「基础权重」可以直接下载官方权重到这里，也可以手动放入 .pt
+      - ./资源/训练权重:/weights
       - maskflow-train-runs:/runs
     gpus: all
     shm_size: "8gb"
@@ -112,6 +115,10 @@ services:
       MASKFLOW_CORS_ORIGINS: ${MASKFLOW_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       SAM_SERVICE_URL: http://sam-inference:8001
       TRAINER_SERVICE_URL: http://trainer:8002
+      # 可下载/删除基础权重的管理员邮箱（逗号分隔）；留空时为第一个注册的账号
+      MASKFLOW_ADMIN_EMAILS: ${MASKFLOW_ADMIN_EMAILS:-}
+      MASKFLOW_TRAIN_MIN_IMAGES: ${MASKFLOW_TRAIN_MIN_IMAGES:-20}
+      MASKFLOW_TRAIN_MIN_PER_CLASS: ${MASKFLOW_TRAIN_MIN_PER_CLASS:-10}
       MASKFLOW_STORAGE: /data/storage
       MASKFLOW_MYSQL: Server=mysql;Port=3306;Database=maskflow;User ID=maskflow;Password=${MYSQL_PASSWORD};Allow User Variables=true;
       MASKFLOW_MINIO_ENDPOINT: http://minio:9000

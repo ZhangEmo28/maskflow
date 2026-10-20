@@ -7,12 +7,22 @@ using ModelContextProtocol.Server;
 [McpServerToolType]
 public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, TrainingWorker trainer)
 {
-    static readonly Dictionary<string, string> Plots = new()
+    // Plot name -> candidate files (Ultralytics names vary slightly between versions and tasks).
+    static readonly Dictionary<string, string[]> Plots = new()
     {
-        ["confusion_matrix_normalized"] = "confusion_matrix_normalized.png",
-        ["confusion_matrix"] = "confusion_matrix.png",
-        ["results"] = "results.png"
+        ["confusion_matrix_normalized"] = ["val/confusion_matrix_normalized.png"],
+        ["confusion_matrix"] = ["val/confusion_matrix.png"],
+        ["results"] = ["train/results.png"],
+        ["pr_curve"] = ["val/BoxPR_curve.png", "val/MaskPR_curve.png", "val/PR_curve.png"],
+        ["f1_curve"] = ["val/BoxF1_curve.png", "val/MaskF1_curve.png", "val/F1_curve.png"],
+        ["val_predictions"] = ["val/val_batch0_pred.jpg"],
+        ["val_labels"] = ["val/val_batch0_labels.jpg"],
+        ["label_distribution"] = ["train/labels.jpg"],
+        ["train_batch"] = ["train/train_batch0.jpg"]
     };
+
+    static TrainingArtifact? Plot(TrainingRun run, string plot) =>
+        Plots.TryGetValue(plot, out var candidates) ? candidates.Select(x => MaskFlowStore.FindArtifact(run, x)).FirstOrDefault(x => x is not null) : null;
 
     [McpServerTool(Name = "start_training", Title = "开始训练", Idempotent = false)]
     [Description("Train a YOLO model on the project's current annotations, starting from a pre-downloaded base weight (list_base_weights). The run trains, evaluates on val (and test if present) and exports best.pt + ONNX; detect/segment results are registered as a project model for auto annotation. Queued in the background — poll get_training. Owner/reviewer only.")]
@@ -85,7 +95,8 @@ public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, Trainin
             evaluation = run.Metrics,
             run.ModelId,
             artifacts = run.Artifacts.Select(x => new { x.Name, x.Size }),
-            plots = Plots.Where(x => run.Artifacts.Any(a => a.Name == x.Value)).Select(x => x.Key),
+            plots = Plots.Keys.Where(x => Plot(run, x) is not null),
+            package = MaskFlowStore.IsActiveTraining(run) ? null : "训练包（基础权重、数据集、训练脚本、全部训练结果）可在训练页下载",
             run.CreatedAt, run.StartedAt, run.FinishedAt,
             downloadPage = $"{McpCaller.PublicUrl}/train.html"
         };
@@ -102,12 +113,12 @@ public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, Trainin
     });
 
     [McpServerTool(Name = "view_training_plot", Title = "查看训练图表", ReadOnly = true, Idempotent = true)]
-    [Description("Image of a finished training's plot: confusion_matrix_normalized (default; which classes get confused with each other or with background), confusion_matrix (counts) or results (Ultralytics training curves).")]
+    [Description("Image of a finished training's plot: confusion_matrix_normalized (default; which classes get confused with each other or with background), confusion_matrix (counts), results (training curves), pr_curve, f1_curve, val_predictions (model predictions on validation images) with val_labels (the same images with the human labels, to compare), label_distribution, train_batch (augmented training samples). get_training lists which exist.")]
     public Task<CallToolResult> ViewTrainingPlot(string training_id, string plot = "confusion_matrix_normalized") => McpCaller.RunAsync(async () =>
     {
         var run = caller.Training(training_id, Permissions.Read);
-        if (!Plots.TryGetValue(plot, out var name)) throw new McpException($"plot 只能是：{string.Join("、", Plots.Keys)}");
-        var artifact = run.Artifacts.FirstOrDefault(x => x.Name == name) ?? throw new McpException("这次训练没有这张图（训练未完成或被删除）。");
+        if (!Plots.ContainsKey(plot)) throw new McpException($"plot 只能是：{string.Join("、", Plots.Keys)}");
+        var artifact = Plot(run, plot) ?? throw new McpException("这次训练没有这张图（训练未完成、被删除，或该任务类型不产生这张图）。");
         await using var stream = await store.OpenStoredObjectAsync(artifact.Path);
         using var buffer = new MemoryStream();
         await stream.CopyToAsync(buffer, caller.Aborted);
@@ -115,7 +126,7 @@ public sealed class TrainingTools(McpCaller caller, MaskFlowStore store, Trainin
         {
             Content =
             [
-                ImageContentBlock.FromBytes(buffer.ToArray(), "image/png"),
+                ImageContentBlock.FromBytes(buffer.ToArray(), MaskFlowStore.ArtifactContentType(artifact.Name)),
                 new TextContentBlock { Text = $"{run.Name} 的 {plot}" }
             ]
         };

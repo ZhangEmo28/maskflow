@@ -26,3 +26,25 @@ test("reads mask metrics for segmentation runs", () => {
   const rows = metricRows({ overall: { "metrics/mAP50(M)": 0.6, "metrics/mAP50-95(M)": 0.4, "metrics/mAP50(B)": 0.9 } }, "segment");
   assert.deepEqual(rows, [{ label: "mAP50", value: 0.6 }, { label: "mAP50-95", value: 0.4 }]);
 });
+
+import { describeArtifact, groupResultImages } from "../src/lib/training.js";
+
+test("groups result images and pairs predictions with labels", () => {
+  const names = [
+    "dataset.zip", "train/weights/best.pt", "train/results.png", "train/labels.jpg", "train/train_batch0.jpg",
+    "val/confusion_matrix.png", "val/confusion_matrix_normalized.png", "val/BoxPR_curve.png", "val/BoxF1_curve.png",
+    "val/val_batch0_labels.jpg", "val/val_batch0_pred.jpg", "val/val_batch1_pred.jpg", "test/confusion_matrix.png", "misc.png"
+  ];
+  const sections = groupResultImages(names.map((name) => ({ name })));
+  const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
+  assert.deepEqual(byKey.predictions.pairs, [
+    { pred: "val/val_batch0_pred.jpg", labels: "val/val_batch0_labels.jpg", title: "val_batch0" },
+    { pred: "val/val_batch1_pred.jpg", labels: null, title: "val_batch1" }
+  ]);
+  assert.deepEqual(byKey.curves.items, ["train/results.png"]);
+  assert.deepEqual(byKey.confusion.items, ["val/confusion_matrix_normalized.png", "val/confusion_matrix.png", "test/confusion_matrix.png"]);
+  assert.deepEqual(byKey.metricCurves.items, ["val/BoxPR_curve.png", "val/BoxF1_curve.png"]);
+  assert.deepEqual(byKey.other.items, ["misc.png"]);
+  assert.equal(sections.some((section) => section.key === "testPredictions"), false);
+  assert.equal(describeArtifact("base/yolo26n.pt"), "基础权重 yolo26n.pt");
+});

@@ -56,6 +56,26 @@ public sealed class TrainingWorker(
         if (next is not null) await StartAsync(next, cancellationToken);
     }
 
+    // The trainer's weight listing as-is: installed weights, the official catalog with download state.
+    public async Task<JsonElement> GetWeightsOverviewAsync(CancellationToken cancellationToken)
+    {
+        using var response = await Client.GetAsync("/api/weights", cancellationToken);
+        using var document = JsonDocument.Parse(await ReadSuccessAsync(response, cancellationToken));
+        return document.RootElement.Clone();
+    }
+
+    public async Task DownloadWeightAsync(string name, CancellationToken cancellationToken)
+    {
+        using var response = await Client.PostAsync($"/api/weights/{Uri.EscapeDataString(name)}/download", null, cancellationToken);
+        await ReadSuccessAsync(response, cancellationToken);
+    }
+
+    public async Task DeleteWeightAsync(string name, CancellationToken cancellationToken)
+    {
+        using var response = await Client.DeleteAsync($"/api/weights/{Uri.EscapeDataString(name)}", cancellationToken);
+        await ReadSuccessAsync(response, cancellationToken);
+    }
+
     public async Task<IReadOnlyList<TrainerWeight>> ListWeightsAsync(CancellationToken cancellationToken)
     {
         using var response = await Client.GetAsync("/api/weights", cancellationToken);
@@ -104,6 +124,10 @@ public sealed class TrainingWorker(
         try
         {
             (zip, var images) = await store.WriteTrainingDatasetAsync(started);
+            // Keep the exact dataset with the run for its training package.
+            var datasetPath = await store.PersistTrainingArtifactAsync(started, MaskFlowStore.DatasetArtifact, zip);
+            var attached = await store.AttachTrainingArtifactAsync(run.Id, new TrainingArtifact(MaskFlowStore.DatasetArtifact, datasetPath, new FileInfo(zip).Length));
+            if (attached is null) return; // cancelled or deleted meanwhile
             using var content = new MultipartFormDataContent();
             await using var stream = File.OpenRead(zip);
             content.Add(new StreamContent(stream), "dataset", "dataset.zip");
@@ -128,7 +152,8 @@ public sealed class TrainingWorker(
         }
         catch (Exception ex) when (IsServiceError(ex, cancellationToken))
         {
-            var failed = await store.FinishTrainingRunAsync(run.Id, "failed", Describe(ex));
+            var message = ex is BadHttpRequestException { StatusCode: 403 } ? "存储空间不足，无法保存本次训练的数据集副本。请清理空间后重试。" : Describe(ex);
+            var failed = await store.FinishTrainingRunAsync(run.Id, "failed", message);
             if (failed is not null) await NotifyAsync(failed);
         }
         finally
@@ -186,17 +211,30 @@ public sealed class TrainingWorker(
 
     async Task CollectAsync(TrainingRun run, JsonElement status, List<Dictionary<string, double>> history, CancellationToken cancellationToken)
     {
-        var available = status.GetProperty("artifacts").EnumerateArray().Select(x => x.GetString()).ToHashSet();
         var metrics = status.TryGetProperty("metrics", out var value) && value.ValueKind == JsonValueKind.Object ? value.Clone() : (JsonElement?)null;
         var artifacts = new List<TrainingArtifact>();
         var temp = Directory.CreateTempSubdirectory("maskflow-train-");
         TrainingRun? completed;
         try
         {
-            foreach (var name in MaskFlowStore.TrainingArtifactNames.Where(available.Contains))
+            // Everything the run produced: base weight copy, best/last weights, ONNX, plots, prediction
+            // samples, results.csv, args.yaml, logs, metrics and environment.
+            List<string> paths;
+            using (var listing = await Client.GetAsync($"/api/train/{run.Id}/files", cancellationToken))
+            using (var document = JsonDocument.Parse(await ReadSuccessAsync(listing, cancellationToken)))
+            {
+                paths = document.RootElement.GetProperty("files").EnumerateArray()
+                    .Select(x => x.GetProperty("path").GetString()!)
+                    .Where(x => MaskFlowStore.IsSafeArtifactPath(x) && x != MaskFlowStore.DatasetArtifact)
+                    .ToList();
+            }
+
+            foreach (var name in paths)
             {
                 var local = Path.Combine(temp.FullName, name);
-                using (var response = await Client.GetAsync($"/api/train/{run.Id}/artifacts/{name}", HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+                var remote = string.Join('/', name.Split('/').Select(Uri.EscapeDataString));
+                using (var response = await Client.GetAsync($"/api/train/{run.Id}/files/{remote}", HttpCompletionOption.ResponseHeadersRead, cancellationToken))
                 {
                     if (!response.IsSuccessStatusCode) await ReadSuccessAsync(response, cancellationToken);
                     await using var file = File.Create(local);
@@ -207,7 +245,7 @@ public sealed class TrainingWorker(
             }
 
             completed = await store.CompleteTrainingRunAsync(run.Id, artifacts, metrics, history);
-            var onnx = Path.Combine(temp.FullName, "best.onnx");
+            var onnx = Path.Combine(temp.FullName, "train", "weights", "best.onnx");
             // Classification models can't drive box/mask auto-annotation, so only detect/segment are registered.
             if (completed is { Task: "detect" or "segment" } && File.Exists(onnx))
             {

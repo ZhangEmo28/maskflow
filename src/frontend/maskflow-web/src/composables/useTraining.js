@@ -1,6 +1,8 @@
 import { computed, reactive } from "vue";
-import { apiFetch, authHeaders, downloadAuthenticated } from "../lib/api";
+import { apiFetch, authHeaders } from "../lib/api";
 import { isActiveTraining, weightCompatibility } from "../lib/training";
+
+const IMAGE_FILE = /\.(png|jpe?g)$/i;
 
 export function useTraining({ projects, selectedProject, currentRole }) {
   const training = reactive({
@@ -15,6 +17,15 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     busy: false,
     readiness: null,
     checking: false,
+    tab: "train",
+    // Base weight catalog (official checkpoints) and who may download/delete them.
+    catalog: [],
+    canManage: false,
+    writable: true,
+    inUse: null,
+    weightTask: "all",
+    confirmOpen: false,
+    lightbox: null,
     form: {
       baseWeight: "",
       epochs: 50,
@@ -27,6 +38,7 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     }
   });
   let timer = null;
+  let weightTimer = null;
   let checkTimer = null;
   let checkSeq = 0;
 
@@ -86,11 +98,17 @@ export function useTraining({ projects, selectedProject, currentRole }) {
       training.available = data.available;
       training.error = data.error || "";
       training.weights = data.weights || [];
+      training.catalog = data.catalog || [];
+      training.canManage = Boolean(data.canManage);
+      training.writable = data.writable !== false;
+      training.inUse = data.inUse || null;
     } catch (error) {
       training.available = false;
       training.error = error.message;
       training.weights = [];
+      training.catalog = [];
     }
+    scheduleWeightPoll();
     // Default to the weight that matches the project type (segment for segmentation, else detect).
     const usable = trainingWeights.value.filter((weight) => weight.ok);
     if (!usable.some((weight) => weight.name === training.form.baseWeight)) {
@@ -123,16 +141,74 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     if (finishedNow || !training.images[id]) await loadImages(data.training);
   }
 
-  // Plots are behind auth, so they are fetched as blobs rather than linked.
+  // Result images are behind auth, so they are fetched as blobs (a few at a time) rather than linked.
   async function loadImages(run) {
+    const names = run.artifacts.map((artifact) => artifact.name).filter((name) => IMAGE_FILE.test(name));
     const urls = {};
-    for (const name of ["confusion_matrix_normalized.png", "confusion_matrix.png", "results.png"]) {
-      if (!run.artifacts.some((artifact) => artifact.name === name)) continue;
-      const response = await fetch(`/api/trainings/${run.id}/artifacts/${name}`, { headers: authHeaders() });
-      if (response.ok) urls[name] = URL.createObjectURL(await response.blob());
+    for (let index = 0; index < names.length; index += 4) {
+      await Promise.all(names.slice(index, index + 4).map(async (name) => {
+        const path = name.split("/").map(encodeURIComponent).join("/");
+        const response = await fetch(`/api/trainings/${run.id}/artifacts/${path}`, { headers: authHeaders() });
+        if (response.ok) urls[name] = URL.createObjectURL(await response.blob());
+      }));
     }
     for (const url of Object.values(training.images[run.id] || {})) URL.revokeObjectURL(url);
     training.images = { ...training.images, [run.id]: urls };
+  }
+
+  function openLightbox(run, name, caption) {
+    const url = training.images[run.id]?.[name];
+    if (url) training.lightbox = { url, caption: caption || name, run, name };
+  }
+
+  // ---- Base weights ----
+
+  function scheduleWeightPoll() {
+    clearTimeout(weightTimer);
+    if (!training.catalog.some((item) => item.download && !item.download.done)) return;
+    weightTimer = setTimeout(loadWeights, 1500);
+  }
+
+  async function downloadBaseWeight(item) {
+    try {
+      await apiFetch(`/api/training/weights/${encodeURIComponent(item.name)}/download`, { method: "POST" });
+      training.status = `开始下载 ${item.name}`;
+      await loadWeights();
+    } catch (error) {
+      training.status = error.message;
+    }
+  }
+
+  async function deleteBaseWeight(name) {
+    if (!window.confirm(`删除基础权重 ${name}？已经训练好的结果不受影响，需要时可以重新下载。`)) return;
+    try {
+      await apiFetch(`/api/training/weights/${encodeURIComponent(name)}`, { method: "DELETE" });
+      training.status = `已删除 ${name}`;
+      await loadWeights();
+    } catch (error) {
+      training.status = error.message;
+    }
+  }
+
+  // ---- Start with a confirmation that shows exactly what will be trained ----
+
+  async function openTrainingConfirm() {
+    clearTimeout(checkTimer);
+    await checkReadiness();
+    if (training.readiness?.error) {
+      training.status = training.readiness.error;
+      return;
+    }
+    if (training.readiness && !training.readiness.ok) {
+      training.status = "数据检查未通过，请先按右侧提示补充数据。";
+      return;
+    }
+    training.confirmOpen = true;
+  }
+
+  async function confirmStartTraining() {
+    training.confirmOpen = false;
+    await startTraining();
   }
 
   function schedulePoll() {
@@ -161,6 +237,7 @@ export function useTraining({ projects, selectedProject, currentRole }) {
 
   function stopTrainingPoll() {
     clearTimeout(timer);
+    clearTimeout(weightTimer);
     clearTimeout(checkTimer);
   }
 
@@ -212,9 +289,18 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     }
   }
 
-  async function downloadTrainingArtifact(run, name) {
+  // Big files go through a short-lived link so the browser's own download manager saves them.
+  async function downloadTrainingFile(run, path = null) {
     try {
-      await downloadAuthenticated(`/api/trainings/${run.id}/artifacts/${name}`, `${run.name}-${name}`.replace(/[\\/:*?"<>|\s]+/g, "_"));
+      const query = path ? `?path=${encodeURIComponent(path)}` : "";
+      const data = await apiFetch(`/api/trainings/${run.id}/download-link${query}`, { method: "POST" });
+      const link = document.createElement("a");
+      link.href = data.url;
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      if (!path) training.status = "正在打包下载训练包（基础权重、数据集、脚本和全部训练结果），文件较大时需要等待片刻。";
     } catch (error) {
       training.status = error.message;
     }
@@ -233,6 +319,11 @@ export function useTraining({ projects, selectedProject, currentRole }) {
     startTraining,
     cancelTraining,
     deleteTraining,
-    downloadTrainingArtifact
+    downloadTrainingFile,
+    openLightbox,
+    downloadBaseWeight,
+    deleteBaseWeight,
+    openTrainingConfirm,
+    confirmStartTraining
   };
 }

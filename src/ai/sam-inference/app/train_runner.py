@@ -56,11 +56,41 @@ def has_test_split(data: Path) -> bool:
     return test_dir.exists() and any(test_dir.iterdir())
 
 
+def write_environment(run_dir: Path, config: dict[str, Any]) -> None:
+    """Versions and hardware the run used, so the training package can be reproduced."""
+    import platform
+
+    info: dict[str, Any] = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "baseWeight": config.get("base_weight"),
+        "baseWeightSha256": config.get("base_weight_sha256"),
+        "args": {key: config.get(key) for key in ("epochs", "imgsz", "batch", "patience", "device")},
+    }
+    try:
+        import ultralytics
+
+        info["ultralytics"] = getattr(ultralytics, "__version__", None)
+    except Exception:  # the runner reports the import failure itself
+        pass
+    try:
+        import torch
+
+        info["torch"] = torch.__version__
+        info["cuda"] = torch.version.cuda
+        if torch.cuda.is_available():
+            info["gpu"] = torch.cuda.get_device_name(0)
+    except Exception:
+        info["torch"] = None
+    (run_dir / "environment.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main(config_path: str) -> int:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     run_dir = Path(config["run_dir"])
     data = Path(config["data"])
     try:
+        write_environment(run_dir, config)
         from ultralytics import YOLO
 
         write_status(run_dir, "training")

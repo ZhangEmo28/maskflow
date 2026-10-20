@@ -1,13 +1,15 @@
 """MaskFlow training service.
 
 Runs on the same image as the inference service but as its own container, so training never
-blocks interactive annotation. Base weights are files an administrator placed in WEIGHTS_DIR
-(trusted .pt checkpoints); each training run executes in a subprocess (app.train_runner) so it
-can be cancelled and frees GPU memory when it ends.
+blocks interactive annotation. Base weights live in WEIGHTS_DIR: official Ultralytics checkpoints
+downloaded from a fixed catalog (size-checked), or trusted .pt files an administrator placed
+there. Each training run executes in a subprocess (app.train_runner) so it can be cancelled and
+frees GPU memory when it ends.
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import hmac
 import json
 import math
@@ -18,6 +20,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,26 @@ ARTIFACTS = {
     "metrics.json": "metrics.json",
 }
 _RUN_ID = re.compile(r"^[a-z0-9_]{1,64}$")
+# Internal files of a run that are not training results (the extracted dataset is kept by the API).
+_PRIVATE_RUN_ENTRIES = {"data", "config.json", "status.json", "dataset.zip"}
+
+# Official checkpoints (github.com/ultralytics/assets, release v8.4.0) with their exact sizes, which
+# double as an integrity check. TRAIN_WEIGHT_BASE_URL can point at a mirror of that release.
+WEIGHT_BASE_URL = os.getenv("TRAIN_WEIGHT_BASE_URL", "https://github.com/ultralytics/assets/releases/download/v8.4.0").rstrip("/")
+_CATALOG_SIZES = {
+    "yolo26n.pt": 5544453, "yolo26s.pt": 20422725, "yolo26m.pt": 44255705, "yolo26l.pt": 53211173, "yolo26x.pt": 118667365,
+    "yolo26n-seg.pt": 6719965, "yolo26s-seg.pt": 23467933, "yolo26m-seg.pt": 54750385, "yolo26l-seg.pt": 63700037, "yolo26x-seg.pt": 142129861,
+    "yolo26n-cls.pt": 5786434, "yolo26s-cls.pt": 13622082, "yolo26m-cls.pt": 23477398, "yolo26l-cls.pt": 28535928, "yolo26x-cls.pt": 59610168,
+    "yolo11n.pt": 5613764, "yolo11s.pt": 19313732, "yolo11m.pt": 40684120, "yolo11l.pt": 51387343, "yolo11x.pt": 114636239,
+    "yolo11n-seg.pt": 6182636, "yolo11s-seg.pt": 20669228, "yolo11m-seg.pt": 45400152, "yolo11l-seg.pt": 56096965, "yolo11x-seg.pt": 125090821,
+    "yolo11n-cls.pt": 5790624, "yolo11s-cls.pt": 13630112, "yolo11m-cls.pt": 23487128, "yolo11l-cls.pt": 28553700, "yolo11x-cls.pt": 59624868,
+    "yolov8n.pt": 6549796, "yolov8s.pt": 22588772, "yolov8m.pt": 52136884, "yolov8l.pt": 87792836, "yolov8x.pt": 136890692,
+    "yolov8n-seg.pt": 7071756, "yolov8s-seg.pt": 23914764, "yolov8m-seg.pt": 54921020, "yolov8l-seg.pt": 92417004, "yolov8x-seg.pt": 144101612,
+    "yolov8n-cls.pt": 5563076, "yolov8s-cls.pt": 12856196, "yolov8m-cls.pt": 34285204, "yolov8l-cls.pt": 75193188, "yolov8x-cls.pt": 115090020,
+}
+_FAMILIES = {"yolo26": "YOLO26", "yolo11": "YOLO11", "yolov8": "YOLOv8"}
+_SCALES = {"n": "nano · 最快", "s": "small", "m": "medium", "l": "large", "x": "xlarge · 最准"}
+_downloads: dict[str, dict[str, Any]] = {}
 
 if REQUIRE_INTERNAL_KEY and not INTERNAL_KEY:
     raise RuntimeError("SAM3_INTERNAL_KEY is required when SAM3_REQUIRE_INTERNAL_KEY is enabled.")
@@ -93,9 +116,98 @@ def weight_path(name: str) -> Path:
     return WEIGHTS_DIR / name
 
 
+def weight_catalog() -> list[dict[str, Any]]:
+    entries = []
+    for name, size in _CATALOG_SIZES.items():
+        match = re.fullmatch(r"(yolo26|yolo11|yolov8)([nsmlx])(-seg|-cls)?\.pt", name)
+        family, scale = match.group(1), match.group(2)
+        entries.append({
+            "name": name, "family": _FAMILIES[family], "scale": scale, "scaleLabel": _SCALES[scale],
+            "task": infer_task(name), "size": size, "url": f"{WEIGHT_BASE_URL}/{name}",
+        })
+    return entries
+
+
+def _weight_in_use() -> str | None:
+    running = _running_run()
+    if running is None:
+        return None
+    config = RUNS_DIR / running / "config.json"
+    try:
+        return json.loads(config.read_text(encoding="utf-8")).get("base_weight")
+    except (OSError, ValueError):
+        return None
+
+
 @app.get("/api/weights")
 def weights() -> dict[str, Any]:
-    return {"weights": list_weights(), "directory": str(WEIGHTS_DIR)}
+    installed = {item["name"]: item for item in list_weights()}
+    catalog = []
+    for entry in weight_catalog():
+        state = _downloads.get(entry["name"])
+        catalog.append({
+            **entry,
+            "installed": entry["name"] in installed,
+            "download": None if state is None or (state["done"] and not state["error"]) else dict(state),
+        })
+    writable = WEIGHTS_DIR.exists() and os.access(WEIGHTS_DIR, os.W_OK)
+    return {"weights": list(installed.values()), "catalog": catalog, "directory": str(WEIGHTS_DIR), "writable": writable, "inUse": _weight_in_use()}
+
+
+def _open_url(url: str):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "MaskFlow-Trainer"}), timeout=60)
+
+
+def _download_weight(entry: dict[str, Any], state: dict[str, Any]) -> None:
+    target = WEIGHTS_DIR / entry["name"]
+    partial = WEIGHTS_DIR / (entry["name"] + ".part")
+    try:
+        with _open_url(entry["url"]) as response, partial.open("wb") as handle:
+            while chunk := response.read(1024 * 1024):
+                state["received"] += len(chunk)
+                if state["received"] > entry["size"]:
+                    raise ValueError("下载的文件比官方文件大，已中止。")
+                handle.write(chunk)
+        # Exact size and a PyTorch checkpoint container (zip) guard against truncated or wrong files.
+        if state["received"] != entry["size"]:
+            raise ValueError(f"文件不完整：{state['received']} / {entry['size']} 字节。")
+        if not zipfile.is_zipfile(partial):
+            raise ValueError("下载的文件不是有效的 PyTorch 权重。")
+        partial.replace(target)
+    except Exception as exc:  # reported through GET /api/weights
+        state["error"] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, ValueError) else str(exc)
+        partial.unlink(missing_ok=True)
+    finally:
+        state["done"] = True
+
+
+@app.post("/api/weights/{name}/download")
+def download_weight(name: str) -> dict[str, Any]:
+    entry = next((item for item in weight_catalog() if item["name"] == name), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="只能下载目录中列出的官方权重。")
+    if (WEIGHTS_DIR / name).exists():
+        return {"name": name, "installed": True}
+    if not WEIGHTS_DIR.exists() or not os.access(WEIGHTS_DIR, os.W_OK):
+        raise HTTPException(status_code=409, detail=f"权重目录 {WEIGHTS_DIR} 不可写，请检查挂载（不能是只读）。")
+    with _lock:
+        state = _downloads.get(name)
+        if state and not state["done"]:
+            return {"name": name, "download": dict(state)}
+        state = {"received": 0, "total": entry["size"], "error": None, "done": False}
+        _downloads[name] = state
+    threading.Thread(target=_download_weight, args=(entry, state), daemon=True).start()
+    return {"name": name, "download": dict(state)}
+
+
+@app.delete("/api/weights/{name}")
+def delete_weight(name: str) -> dict[str, bool]:
+    path = weight_path(name)
+    if _weight_in_use() == name:
+        raise HTTPException(status_code=409, detail="这个权重正在被训练使用，训练结束后再删除。")
+    path.unlink(missing_ok=True)
+    _downloads.pop(name, None)
+    return {"deleted": True}
 
 
 # ---- Runs ----
@@ -198,10 +310,16 @@ async def start_training(
     finally:
         archive.unlink(missing_ok=True)
 
+    base_dir = directory / "base"
+    base_dir.mkdir()
+    base_copy = base_dir / weights_file.name
+    shutil.copy2(weights_file, base_copy)
     config = {
         "run_dir": str(directory),
         "data": str(data_yaml),
-        "weights": str(weights_file),
+        "weights": str(base_copy),
+        "base_weight": weights_file.name,
+        "base_weight_sha256": _sha256(base_copy),
         "epochs": epochs,
         "imgsz": imgsz,
         "batch": batch,
@@ -213,6 +331,14 @@ async def start_training(
     with _lock:
         _processes[run_id] = _launch(directory)
     return {"runId": run_id, "status": "running"}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_status(directory: Path, phase: str, **extra: Any) -> None:
@@ -298,6 +424,36 @@ def artifact(run_id: str, name: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact not available.")
     return FileResponse(path, filename=name)
+
+
+def run_files(directory: Path) -> list[dict[str, Any]]:
+    files = []
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory)
+        if not path.is_file() or relative.parts[0] in _PRIVATE_RUN_ENTRIES or path.name.endswith(".part"):
+            continue
+        files.append({"path": relative.as_posix(), "size": path.stat().st_size})
+    return files
+
+
+# Everything a run produced (base weight copy, weights, plots, csv, args, logs, metrics), for the
+# API to keep and package; the extracted dataset and internal state files are excluded.
+@app.get("/api/train/{run_id}/files")
+def training_files(run_id: str) -> dict[str, Any]:
+    directory = run_dir(run_id)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return {"files": run_files(directory)}
+
+
+@app.get("/api/train/{run_id}/files/{path:path}")
+def training_file(run_id: str, path: str):
+    directory = run_dir(run_id).resolve()
+    candidate = (directory / path).resolve()
+    if (not str(candidate).startswith(str(directory) + os.sep) or not candidate.is_file()
+            or candidate.relative_to(directory).parts[0] in _PRIVATE_RUN_ENTRIES):
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(candidate, filename=candidate.name)
 
 
 @app.delete("/api/train/{run_id}")
